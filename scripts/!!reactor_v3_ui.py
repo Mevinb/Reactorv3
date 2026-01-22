@@ -154,53 +154,6 @@ class ReactorV3Script(scripts.Script):
                 
                 refresh_button = gr.Button("🔄 Refresh Models")
             
-            # Advanced Realism Controls
-            with gr.Accordion("⚙️ Advanced Realism Controls", open=False):
-                with gr.Row():
-                    blend_ratio = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        step=0.05,
-                        value=1.0,
-                        label="Face Blend Strength",
-                        info="1.0 = full swap, 0.5 = 50% blend (for subtle merging)"
-                    )
-                    
-                    face_detection_threshold = gr.Slider(
-                        minimum=0.1,
-                        maximum=0.99,
-                        step=0.05,
-                        value=0.5,
-                        label="Face Detection Confidence",
-                        info="Higher = stricter face detection (0.5 recommended)"
-                    )
-                
-                with gr.Row():
-                    color_correction = gr.Checkbox(
-                        label="Color Correction",
-                        value=True,
-                        info="Match swapped face skin tone to target lighting"
-                    )
-                    
-                    upscale_factor = gr.Slider(
-                        minimum=1,
-                        maximum=2,
-                        step=1,
-                        value=1,
-                        label="Upscale Factor",
-                        info="2x = Extract faces at 2x resolution before restoration (slower, sharper)"
-                    )
-                
-                with gr.Row():
-                    resolution_threshold = gr.Slider(
-                        minimum=256,
-                        maximum=768,
-                        step=64,
-                        value=384,
-                        label="Auto-Resolution Threshold (px)",
-                        info="Face size above this uses 1024, below uses 512"
-                    )
-            
             gr.Markdown("""
             **💡 Tips:**
             - Upload source face image above
@@ -211,13 +164,6 @@ class ReactorV3Script(scripts.Script):
             - **Smart Match**: Automatically swaps only matching gender (e.g., female source → female target)
             - **Gender Filter**: Use M/F to swap only male or female faces regardless of source
             - **Aggressive Cleanup**: Enable if you have limited VRAM (<12GB) for consistent speed
-            
-            **⚙️ Advanced Realism Tips:**
-            - **Blend Strength**: Use 0.85-0.95 for subtle, natural-looking blends
-            - **Color Correction**: Always enable for photorealistic lighting match
-            - **Upscale 2x**: Use with GPEN-1024 for ultra-sharp 2048px faces (slower)
-            - **Detection Threshold**: Lower (0.3-0.4) for difficult angles, higher (0.6-0.7) for quality control
-            - **Resolution Threshold**: Lower (256-320) for aggressive 1024 usage, higher (448-512) for speed
             
             **📁 Model Location:** `extensions/sd-webui-reactor-v3/models/facerestore_models/`
             """)
@@ -230,12 +176,10 @@ class ReactorV3Script(scripts.Script):
             )
         
         return [enabled, source_image, source_face_index, target_face_index, 
-                restore_model, gender_match, auto_resolution, aggressive_cleanup,
-                blend_ratio, face_detection_threshold, color_correction, upscale_factor, resolution_threshold]
+                restore_model, gender_match, auto_resolution, aggressive_cleanup]
     
     def postprocess_image(self, p, pp, enabled, source_image, source_face_index,
-                         target_face_index, restore_model, gender_match, auto_resolution, aggressive_cleanup,
-                         blend_ratio, face_detection_threshold, color_correction, upscale_factor, resolution_threshold):
+                         target_face_index, restore_model, gender_match, auto_resolution, aggressive_cleanup):
         """
         Process each image individually BEFORE it gets saved.
         This is called per-image and runs before saving, ensuring processed versions get saved.
@@ -278,19 +222,14 @@ class ReactorV3Script(scripts.Script):
             
             print(f"[ReActor V3] Processing image before save...")
             
-            # Process with ReActor V3 (with advanced controls)
+            # Process with ReActor V3
             result_cv2, status = engine.process(
                 source_img=source_cv2,
                 target_img=target_cv2,
                 source_face_index=int(source_face_index),
                 target_face_index=int(target_face_index),
                 restore_model=restore_model,
-                gender_match=gender_match,
-                blend_ratio=float(blend_ratio),
-                detection_threshold=float(face_detection_threshold),
-                color_correction=bool(color_correction),
-                upscale_factor=int(upscale_factor),
-                resolution_threshold=int(resolution_threshold)
+                gender_match=gender_match
             )
             
             # Replace the image in-place

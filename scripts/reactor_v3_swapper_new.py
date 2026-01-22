@@ -66,22 +66,19 @@ class ReActorV3:
         print(f"[ReActor V3] GPEN models path: {self.facerestore_path}")
         print(f"[ReActor V3] Auto VRAM cleanup: {self.auto_cleanup} (aggressive={self.aggressive_cleanup})")
     
-    def initialize_face_analyser(self, detection_threshold: float = 0.5):
+    def initialize_face_analyser(self):
         if not INSIGHTFACE_AVAILABLE:
             raise ImportError("InsightFace not installed")
         
         if self.face_analyser is None:
-            print(f"[ReActor V3] Initializing face analyzer (threshold={detection_threshold})...")
+            print("[ReActor V3] Initializing face analyzer...")
             self.face_analyser = FaceAnalysis(
                 name='buffalo_l',
                 root=self.insightface_path,
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
-            self.face_analyser.prepare(ctx_id=0, det_size=(640, 640), det_thresh=detection_threshold)
+            self.face_analyser.prepare(ctx_id=0, det_size=(640, 640))
             print("[ReActor V3] Face analyzer ready")
-        else:
-            # Update threshold if changed
-            self.face_analyser.det_thresh = detection_threshold
     
     def initialize_face_swapper(self, model_name: str = 'inswapper_128.onnx'):
         if not INSIGHTFACE_AVAILABLE:
@@ -175,64 +172,6 @@ class ReActorV3:
         
         return filtered
     
-    def apply_color_correction(self, swapped_img: np.ndarray, target_img: np.ndarray, target_face) -> np.ndarray:
-        """
-        Apply color correction to match swapped face to target image lighting.
-        Uses color transfer in LAB color space for natural results.
-        
-        Args:
-            swapped_img: Image with swapped face
-            target_img: Original target image
-            target_face: Face object from InsightFace with bbox coordinates
-            
-        Returns:
-            Color-corrected image
-        """
-        try:
-            # Get face bounding box with some expansion for better color matching
-            bbox = target_face.bbox.astype(int)
-            x1, y1, x2, y2 = bbox
-            
-            # Expand bbox by 20% for better color context
-            h, w = y2 - y1, x2 - x1
-            expand = int(max(h, w) * 0.2)
-            x1 = max(0, x1 - expand)
-            y1 = max(0, y1 - expand)
-            x2 = min(target_img.shape[1], x2 + expand)
-            y2 = min(target_img.shape[0], y2 + expand)
-            
-            # Extract face regions
-            swapped_face_region = swapped_img[y1:y2, x1:x2]
-            target_face_region = target_img[y1:y2, x1:x2]
-            
-            # Convert to LAB color space for color transfer
-            swapped_lab = cv2.cvtColor(swapped_face_region, cv2.COLOR_BGR2LAB).astype(np.float32)
-            target_lab = cv2.cvtColor(target_face_region, cv2.COLOR_BGR2LAB).astype(np.float32)
-            
-            # Calculate mean and std for each channel
-            swapped_mean, swapped_std = cv2.meanStdDev(swapped_lab)
-            target_mean, target_std = cv2.meanStdDev(target_lab)
-            
-            # Apply color correction formula
-            swapped_lab -= swapped_mean.reshape(1, 1, 3)
-            swapped_lab *= (target_std / swapped_std).reshape(1, 1, 3)
-            swapped_lab += target_mean.reshape(1, 1, 3)
-            
-            # Clip and convert back
-            swapped_lab = np.clip(swapped_lab, 0, 255).astype(np.uint8)
-            corrected_face = cv2.cvtColor(swapped_lab, cv2.COLOR_LAB2BGR)
-            
-            # Blend corrected face back into result
-            result = swapped_img.copy()
-            result[y1:y2, x1:x2] = corrected_face
-            
-            print(f"[ReActor V3] Color correction applied (target mean: L={target_mean[0][0]:.1f}, A={target_mean[1][0]:.1f}, B={target_mean[2][0]:.1f})")
-            return result
-            
-        except Exception as e:
-            print(f"[ReActor V3] Color correction failed: {e}, using original")
-            return swapped_img
-    
     def set_cleanup_mode(self, aggressive: bool):
         """Set whether cleanup should be aggressive (unload all models)"""
         self.aggressive_cleanup = aggressive
@@ -266,39 +205,24 @@ class ReActorV3:
                 source_face_index: int = 0,
                 target_face_index: int = 0,
                 restore_model: str = None,
-                gender_match: str = 'A',
-                blend_ratio: float = 1.0,
-                detection_threshold: float = 0.5,
-                color_correction: bool = True,
-                upscale_factor: int = 1,
-                resolution_threshold: int = 384) -> Tuple[np.ndarray, str]:
+                gender_match: str = 'A') -> Tuple[np.ndarray, str]:
         """
-        Advanced workflow with realism controls:
-        1. Swap face using InsightFace (with gender filtering and blend control)
-        2. Apply color correction for lighting match
-        3. Restore entire image using GPEN+FaceRestoreHelper with optional upscaling
+        Simple workflow with gender matching:
+        1. Swap face using InsightFace (with gender filtering)
+        2. Restore entire image using GPEN+FaceRestoreHelper
         
         Args:
             gender_match: 'A' (all), 'M' (male only), 'F' (female only), 'S' (smart match)
-            blend_ratio: 0.0-1.0, controls how much of swapped face to blend (1.0 = full swap)
-            detection_threshold: Face detection confidence threshold (0.1-0.99)
-            color_correction: Apply color correction to match target lighting
-            upscale_factor: Extract faces at 1x or 2x resolution before restoration
-            resolution_threshold: Face size threshold for auto-selecting 512 vs 1024 GPEN
         """
         try:
-            # Initialize with detection threshold
+            # Initialize
             if self.face_analyser is None:
-                self.initialize_face_analyser(detection_threshold)
-            else:
-                # Update threshold if changed
-                self.face_analyser.det_thresh = detection_threshold
-            
+                self.initialize_face_analyser()
             if self.face_swapper is None:
                 self.initialize_face_swapper()
             
             # Detect faces
-            print(f"[ReActor V3] Detecting faces (threshold={detection_threshold})...")
+            print("[ReActor V3] Detecting faces...")
             source_faces = self.get_faces(source_img)
             target_faces = self.get_faces(target_img)
             
@@ -340,18 +264,8 @@ class ReActorV3:
             print(f"[ReActor V3] Swapping: Source ({source_gender}) -> Target ({target_gender})")
             
             # Swap face (InsightFace handles blending with paste_back=True)
-            print(f"[ReActor V3] Swapping face (blend={blend_ratio:.2f})...")
+            print("[ReActor V3] Swapping face...")
             result = self.face_swapper.get(target_img, target_face, source_face, paste_back=True)
-            
-            # Apply blend ratio if not full swap
-            if blend_ratio < 1.0:
-                print(f"[ReActor V3] Applying blend ratio {blend_ratio:.2f}...")
-                result = cv2.addWeighted(result, blend_ratio, target_img, 1 - blend_ratio, 0)
-            
-            # Apply color correction to match target lighting
-            if color_correction:
-                print("[ReActor V3] Applying color correction...")
-                result = self.apply_color_correction(result, target_img, target_face)
             
             # Restore using GPEN if specified
             if restore_model:
@@ -359,32 +273,14 @@ class ReActorV3:
                     return result, "Swapped (restoration failed to load)"
                 
                 if self.current_restorer:
-                    # Set upscale factor for face extraction
-                    if upscale_factor > 1:
-                        print(f"[ReActor V3] Using {upscale_factor}x upscale for face extraction...")
-                        self.current_restorer.face_helper.upscale_factor = upscale_factor
-                    
-                    print(f"[ReActor V3] Restoring with {restore_model} (upscale={upscale_factor}x)...")
+                    print(f"[ReActor V3] Restoring with {restore_model}...")
+                    # This uses WebUI's FaceRestoreHelper - no custom masking!
                     restored_result = self.current_restorer.restore(result)
-                    
-                    # Reset upscale factor
-                    if upscale_factor > 1:
-                        self.current_restorer.face_helper.upscale_factor = 1
-                    
-                    status_msg = f"Swapped and restored with {restore_model}"
-                    if blend_ratio < 1.0:
-                        status_msg += f" (blend={blend_ratio:.0%})"
-                    if color_correction:
-                        status_msg += " + color corrected"
-                    if upscale_factor > 1:
-                        status_msg += f" + {upscale_factor}x upscaled"
-                    
-                    print(f"[ReActor V3] {status_msg}")
-                    
+                    print(f"[ReActor V3] Swapped and restored with {restore_model}")
                     # Automatic VRAM cleanup after processing
                     if self.auto_cleanup:
                         self.cleanup_memory(aggressive=self.aggressive_cleanup)
-                    return restored_result, status_msg
+                    return restored_result, f"Swapped and restored with {restore_model}"
             
             # Automatic VRAM cleanup after processing
             if self.auto_cleanup:
