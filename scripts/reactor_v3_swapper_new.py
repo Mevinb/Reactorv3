@@ -113,6 +113,65 @@ class ReActorV3:
             self.initialize_face_analyser()
         return self.face_analyser.get(img)
     
+    def get_gender(self, face) -> str:
+        """
+        Get gender from a face object.
+        
+        InsightFace returns gender as an attribute where:
+        - 0 or negative values = Female
+        - 1 or positive values = Male
+        
+        Args:
+            face: Face detection object from InsightFace
+            
+        Returns:
+            'M' for male, 'F' for female, 'U' for unknown
+        """
+        try:
+            if hasattr(face, 'gender'):
+                gender_value = face.gender
+                if isinstance(gender_value, (int, float, np.integer, np.floating)):
+                    return 'M' if gender_value >= 0.5 else 'F'
+            elif hasattr(face, 'sex'):
+                sex_value = face.sex
+                if isinstance(sex_value, (int, float, np.integer, np.floating)):
+                    return 'M' if sex_value >= 0.5 else 'F'
+            
+            if hasattr(face, '__dict__'):
+                face_dict = face.__dict__
+                if 'gender' in face_dict:
+                    return 'M' if face_dict['gender'] >= 0.5 else 'F'
+                if 'sex' in face_dict:
+                    return 'M' if face_dict['sex'] >= 0.5 else 'F'
+            
+            return 'U'
+        except Exception as e:
+            print(f"[ReActor V3] Warning: Could not determine gender: {e}")
+            return 'U'
+    
+    def filter_faces_by_gender(self, faces: List, target_gender: str) -> List:
+        """
+        Filter faces by gender.
+        
+        Args:
+            faces: List of face detection objects
+            target_gender: 'M' for male, 'F' for female, 'A' for all (no filter)
+            
+        Returns:
+            Filtered list of faces
+        """
+        if not faces or target_gender == 'A':
+            return faces
+        
+        filtered = []
+        for i, face in enumerate(faces):
+            gender = self.get_gender(face)
+            if gender == target_gender or gender == 'U':
+                filtered.append(face)
+            print(f"[ReActor V3] Face {i}: Gender={gender} {'✓' if gender == target_gender or gender == 'U' else '✗'}")
+        
+        return filtered
+    
     def set_cleanup_mode(self, aggressive: bool):
         """Set whether cleanup should be aggressive (unload all models)"""
         self.aggressive_cleanup = aggressive
@@ -145,11 +204,15 @@ class ReActorV3:
                 target_img: np.ndarray,
                 source_face_index: int = 0,
                 target_face_index: int = 0,
-                restore_model: str = None) -> Tuple[np.ndarray, str]:
+                restore_model: str = None,
+                gender_match: str = 'A') -> Tuple[np.ndarray, str]:
         """
-        Simple workflow:
-        1. Swap face using InsightFace
+        Simple workflow with gender matching:
+        1. Swap face using InsightFace (with gender filtering)
         2. Restore entire image using GPEN+FaceRestoreHelper
+        
+        Args:
+            gender_match: 'A' (all), 'M' (male only), 'F' (female only), 'S' (smart match)
         """
         try:
             # Initialize
@@ -168,8 +231,37 @@ class ReActorV3:
             if not target_faces:
                 return target_img, "Error: No face in target"
             
+            # Apply gender matching
+            if gender_match == 'S':  # Smart match
+                source_face = source_faces[min(source_face_index, len(source_faces)-1)]
+                source_gender = self.get_gender(source_face)
+                print(f"[ReActor V3] Smart Match: Source gender = {source_gender}")
+                
+                filtered_target_faces = self.filter_faces_by_gender(target_faces, source_gender)
+                if not filtered_target_faces:
+                    gender_name = "male" if source_gender == 'M' else "female" if source_gender == 'F' else "matching"
+                    return target_img, f"Error: No {gender_name} face in target to match source"
+                target_faces = filtered_target_faces
+                
+            elif gender_match in ['M', 'F']:  # Filter by specific gender
+                print(f"[ReActor V3] Gender Filter: {gender_match}")
+                source_faces = self.filter_faces_by_gender(source_faces, gender_match)
+                target_faces = self.filter_faces_by_gender(target_faces, gender_match)
+                
+                if not source_faces:
+                    gender_name = "male" if gender_match == 'M' else "female"
+                    return target_img, f"Error: No {gender_name} face in source"
+                if not target_faces:
+                    gender_name = "male" if gender_match == 'M' else "female"
+                    return target_img, f"Error: No {gender_name} face in target"
+            
             source_face = source_faces[min(source_face_index, len(source_faces)-1)]
             target_face = target_faces[min(target_face_index, len(target_faces)-1)]
+            
+            # Display gender info
+            source_gender = self.get_gender(source_face)
+            target_gender = self.get_gender(target_face)
+            print(f"[ReActor V3] Swapping: Source ({source_gender}) -> Target ({target_gender})")
             
             # Swap face (InsightFace handles blending with paste_back=True)
             print("[ReActor V3] Swapping face...")

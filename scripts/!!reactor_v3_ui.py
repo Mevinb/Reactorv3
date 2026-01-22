@@ -127,6 +127,19 @@ class ReactorV3Script(scripts.Script):
                     )
             
             with gr.Row():
+                gender_match = gr.Radio(
+                    label="Gender Matching Mode",
+                    choices=[
+                        ("All (No Filter)", "A"),
+                        ("Smart Match (Auto-detect)", "S"),
+                        ("Male Only", "M"),
+                        ("Female Only", "F")
+                    ],
+                    value="S",
+                    info="S=Match source gender automatically, M/F=Filter specific gender"
+                )
+            
+            with gr.Row():
                 auto_resolution = gr.Checkbox(
                     label="Auto-Select Resolution",
                     value=True,
@@ -148,6 +161,8 @@ class ReactorV3Script(scripts.Script):
             - GPEN-512: Fast, good quality (full body shots)
             - GPEN-1024: Slower, maximum quality (portraits)
             - Auto-resolution recommended for best speed/quality balance
+            - **Smart Match**: Automatically swaps only matching gender (e.g., female source → female target)
+            - **Gender Filter**: Use M/F to swap only male or female faces regardless of source
             - **Aggressive Cleanup**: Enable if you have limited VRAM (<12GB) for consistent speed
             
             **📁 Model Location:** `extensions/sd-webui-reactor-v3/models/facerestore_models/`
@@ -161,10 +176,10 @@ class ReactorV3Script(scripts.Script):
             )
         
         return [enabled, source_image, source_face_index, target_face_index, 
-                restore_model, auto_resolution, aggressive_cleanup]
+                restore_model, gender_match, auto_resolution, aggressive_cleanup]
     
     def postprocess_image(self, p, pp, enabled, source_image, source_face_index,
-                         target_face_index, restore_model, auto_resolution, aggressive_cleanup):
+                         target_face_index, restore_model, gender_match, auto_resolution, aggressive_cleanup):
         """
         Process each image individually BEFORE it gets saved.
         This is called per-image and runs before saving, ensuring processed versions get saved.
@@ -213,7 +228,8 @@ class ReactorV3Script(scripts.Script):
                 target_img=target_cv2,
                 source_face_index=int(source_face_index),
                 target_face_index=int(target_face_index),
-                restore_model=restore_model
+                restore_model=restore_model,
+                gender_match=gender_match
             )
             
             # Replace the image in-place
