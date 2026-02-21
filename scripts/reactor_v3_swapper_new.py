@@ -14,6 +14,43 @@ from PIL import Image
 import torch
 import gc
 
+# Setup cuDNN path for ONNX Runtime CUDA provider
+def setup_cudnn_path():
+    """Add cuDNN and cuBLAS to PATH if available"""
+    try:
+        import site
+        site_packages = site.getsitepackages()
+        paths_added = []
+        for site_pkg in site_packages:
+            # Add cuDNN path
+            cudnn_bin_path = os.path.join(site_pkg, 'nvidia', 'cudnn', 'bin')
+            if os.path.exists(cudnn_bin_path):
+                current_path = os.environ.get('PATH', '')
+                if cudnn_bin_path not in current_path:
+                    os.environ['PATH'] = cudnn_bin_path + os.pathsep + current_path
+                    paths_added.append(cudnn_bin_path)
+            
+            # Add cuBLAS path
+            cublas_bin_path = os.path.join(site_pkg, 'nvidia', 'cublas', 'bin')
+            if os.path.exists(cublas_bin_path):
+                current_path = os.environ.get('PATH', '')
+                if cublas_bin_path not in current_path:
+                    os.environ['PATH'] = cublas_bin_path + os.pathsep + current_path
+                    paths_added.append(cublas_bin_path)
+        
+        if paths_added:
+            print(f"[ReActor V3] Added CUDA libraries to PATH: {paths_added}")
+            return True
+        else:
+            print("[ReActor V3] CUDA libraries (cuDNN/cuBLAS) not found in site-packages")
+            return False
+    except Exception as e:
+        print(f"[ReActor V3] Error setting up CUDA libraries path: {e}")
+        return False
+
+# Setup cuDNN path on import
+setup_cudnn_path()
+
 try:
     import insightface
     from insightface.app import FaceAnalysis
@@ -198,6 +235,141 @@ class ReActorV3:
         except Exception as e:
             print(f"[ReActor V3] Error loading restorer: {e}")
             return False
+
+    def _get_safe_face_bbox(self, face, image_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
+        """Clamp face bbox to image bounds and ensure a valid region."""
+        img_h, img_w = image_shape[:2]
+
+        if not hasattr(face, 'bbox') or face.bbox is None:
+            return 0, 0, img_w, img_h
+
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1 = max(0, min(x1, img_w - 1))
+        y1 = max(0, min(y1, img_h - 1))
+        x2 = max(x1 + 1, min(x2, img_w))
+        y2 = max(y1 + 1, min(y2, img_h))
+        return x1, y1, x2, y2
+
+    def _build_soft_face_mask(self, face, image_shape: Tuple[int, int, int]) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        """Create a feathered alpha mask around the swapped face region."""
+        img_h, img_w = image_shape[:2]
+        x1, y1, x2, y2 = self._get_safe_face_bbox(face, image_shape)
+
+        face_w = max(1, x2 - x1)
+        face_h = max(1, y2 - y1)
+
+        # Expand region so blend transition happens outside key facial features.
+        pad_x = max(4, int(face_w * 0.18))
+        pad_y = max(4, int(face_h * 0.22))
+        ex1 = max(0, x1 - pad_x)
+        ey1 = max(0, y1 - pad_y)
+        ex2 = min(img_w, x2 + pad_x)
+        ey2 = min(img_h, y2 + pad_y)
+
+        mask = np.zeros((img_h, img_w), dtype=np.float32)
+
+        center = ((ex1 + ex2) // 2, (ey1 + ey2) // 2)
+        axes = (max(2, (ex2 - ex1) // 2), max(2, (ey2 - ey1) // 2))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+
+        # Landmarks (if available) help keep high-confidence face areas in the mask.
+        if hasattr(face, 'kps') and face.kps is not None:
+            kps = np.asarray(face.kps, dtype=np.float32)
+            if kps.ndim == 2 and kps.shape[0] >= 3:
+                lm_mask = np.zeros_like(mask)
+                hull = cv2.convexHull(kps.astype(np.int32))
+                cv2.fillConvexPoly(lm_mask, hull, 1.0)
+                dilate_k = max(3, int(min(face_w, face_h) * 0.10))
+                kernel = np.ones((dilate_k, dilate_k), dtype=np.uint8)
+                lm_mask = cv2.dilate(lm_mask, kernel, iterations=1)
+                mask = np.maximum(mask, lm_mask * 0.9)
+
+        feather = max(9, int(min(face_w, face_h) * 0.20))
+        if feather % 2 == 0:
+            feather += 1
+        mask = cv2.GaussianBlur(mask, (feather, feather), feather * 0.35)
+        mask = np.clip(mask, 0.0, 1.0)
+
+        return mask, (x1, y1, x2, y2)
+
+    def _texture_energy(self, img: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+        """Estimate local detail using Laplacian magnitude."""
+        if img is None or img.size == 0:
+            return 0.0
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        energy = np.abs(lap)
+
+        if mask is not None:
+            valid = mask > 0.25
+            if np.any(valid):
+                return float(np.mean(energy[valid]))
+
+        return float(np.mean(energy))
+
+    def _get_adaptive_restore_weight(self, swapped_img: np.ndarray, restored_img: np.ndarray, face_mask: np.ndarray) -> Tuple[float, float]:
+        """
+        Prevent over-sharp restored faces by adapting blend weight to local detail ratio.
+        Returns (restore_weight, detail_ratio).
+        """
+        swapped_detail = self._texture_energy(swapped_img, face_mask)
+        restored_detail = self._texture_energy(restored_img, face_mask)
+
+        if swapped_detail <= 1e-6:
+            return 0.85, 1.0
+
+        detail_ratio = restored_detail / swapped_detail
+        restore_weight = 1.0
+        if detail_ratio > 1.08:
+            # If restored face is much sharper than base image, pull it back slightly.
+            restore_weight = max(0.65, 1.0 - 0.55 * (detail_ratio - 1.0))
+
+        return float(np.clip(restore_weight, 0.65, 1.0)), float(detail_ratio)
+
+    def _harmonize_restored_face(self, swapped_img: np.ndarray, restored_img: np.ndarray, target_face) -> np.ndarray:
+        """
+        Blend restored face back into the swapped image with adaptive strength and seam cleanup.
+        This keeps face detail natural relative to body/detail level and reduces edge artifacts.
+        """
+        if swapped_img is None or restored_img is None:
+            return restored_img
+        if swapped_img.shape != restored_img.shape:
+            return restored_img
+
+        mask, (x1, y1, x2, y2) = self._build_soft_face_mask(target_face, swapped_img.shape)
+        if mask is None:
+            return restored_img
+
+        swapped_f = swapped_img.astype(np.float32)
+        restored_f = restored_img.astype(np.float32)
+
+        restore_weight, detail_ratio = self._get_adaptive_restore_weight(swapped_img, restored_img, mask)
+        harmonized = cv2.addWeighted(restored_f, restore_weight, swapped_f, 1.0 - restore_weight, 0.0)
+
+        mask_3ch = mask[:, :, None]
+        blended = harmonized * mask_3ch + swapped_f * (1.0 - mask_3ch)
+
+        # Extra seam protection: reintroduce a little swapped image on the transition ring.
+        face_w = max(1, x2 - x1)
+        face_h = max(1, y2 - y1)
+        ring_k = max(3, int(min(face_w, face_h) * 0.08))
+        ring_kernel = np.ones((ring_k, ring_k), dtype=np.uint8)
+
+        binary_mask = (mask * 255.0).astype(np.uint8)
+        inner = cv2.erode(binary_mask, ring_kernel, iterations=1).astype(np.float32) / 255.0
+        outer = cv2.dilate(binary_mask, ring_kernel, iterations=1).astype(np.float32) / 255.0
+        edge_ring = np.clip(outer - inner, 0.0, 1.0)[:, :, None]
+
+        seam_preserve = 0.40
+        blended = blended * (1.0 - edge_ring * seam_preserve) + swapped_f * (edge_ring * seam_preserve)
+
+        print(
+            f"[ReActor V3] Harmonized restore: detail_ratio={detail_ratio:.2f}, "
+            f"restore_weight={restore_weight:.2f}, seam_preserve={seam_preserve:.2f}"
+        )
+
+        return np.clip(blended, 0, 255).astype(np.uint8)
     
     def process(self,
                 source_img: np.ndarray,
@@ -274,8 +446,8 @@ class ReActorV3:
                 
                 if self.current_restorer:
                     print(f"[ReActor V3] Restoring with {restore_model}...")
-                    # This uses WebUI's FaceRestoreHelper - no custom masking!
                     restored_result = self.current_restorer.restore(result)
+                    restored_result = self._harmonize_restored_face(result, restored_result, target_face)
                     print(f"[ReActor V3] Swapped and restored with {restore_model}")
                     # Automatic VRAM cleanup after processing
                     if self.auto_cleanup:

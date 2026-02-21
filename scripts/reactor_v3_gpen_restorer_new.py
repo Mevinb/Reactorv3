@@ -12,6 +12,43 @@ import os
 from typing import Optional
 import torch
 
+# Setup cuDNN path for ONNX Runtime CUDA provider
+def setup_cudnn_path():
+    """Add cuDNN and cuBLAS to PATH if available"""
+    try:
+        import site
+        site_packages = site.getsitepackages()
+        paths_added = []
+        for site_pkg in site_packages:
+            # Add cuDNN path
+            cudnn_bin_path = os.path.join(site_pkg, 'nvidia', 'cudnn', 'bin')
+            if os.path.exists(cudnn_bin_path):
+                current_path = os.environ.get('PATH', '')
+                if cudnn_bin_path not in current_path:
+                    os.environ['PATH'] = cudnn_bin_path + os.pathsep + current_path
+                    paths_added.append(cudnn_bin_path)
+            
+            # Add cuBLAS path
+            cublas_bin_path = os.path.join(site_pkg, 'nvidia', 'cublas', 'bin')
+            if os.path.exists(cublas_bin_path):
+                current_path = os.environ.get('PATH', '')
+                if cublas_bin_path not in current_path:
+                    os.environ['PATH'] = cublas_bin_path + os.pathsep + current_path
+                    paths_added.append(cublas_bin_path)
+        
+        if paths_added:
+            print(f"[ReActor V3] Added CUDA libraries to PATH: {paths_added}")
+            return True
+        else:
+            print("[ReActor V3] CUDA libraries (cuDNN/cuBLAS) not found in site-packages")
+            return False
+    except Exception as e:
+        print(f"[ReActor V3] Error setting up CUDA libraries path: {e}")
+        return False
+
+# Setup cuDNN path on import
+setup_cudnn_path()
+
 # Use WebUI's face restoration infrastructure
 import sys
 webui_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
