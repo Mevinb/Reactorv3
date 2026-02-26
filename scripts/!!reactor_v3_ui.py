@@ -7,6 +7,7 @@ script that automatically enhances faces after SD generation using GPEN-512/1024
 
 import os
 import sys
+import time
 import gradio as gr
 import modules.scripts as scripts
 from typing import Optional
@@ -16,6 +17,7 @@ from modules.shared import opts, state
 from PIL import Image
 import numpy as np
 import cv2
+import torch
 
 # Add extension scripts path for imports
 _ext_scripts_path = os.path.dirname(os.path.abspath(__file__))
@@ -171,6 +173,82 @@ class ReactorV3Script(scripts.Script):
                 
                 refresh_button = gr.Button("🔄 Refresh Models")
 
+            with gr.Row():
+                occlusion_enabled = gr.Checkbox(
+                    label="Adaptive Occlusion Handling",
+                    value=True,
+                    info="Keep foreground occluders in front of swapped faces"
+                )
+                occlusion_strength = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=1.0,
+                    label="Occlusion Preserve Strength",
+                    info="How strongly original occluding objects are preserved"
+                )
+                occlusion_sensitivity = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=0.55,
+                    label="Occlusion Detection Sensitivity",
+                    info="Higher sensitivity catches more potential occluders"
+                )
+
+            # ── Auto Face Match block ─────────────────────────────────────────
+            with gr.Accordion("🎯 Auto Face Match (Embedding-Based)", open=False):
+                gr.Markdown("""
+                **Automatic face detection & matching** using ArcFace embedding cosine similarity.
+                No more manual face index selection — the system automatically finds which target face
+                best matches each source face and swaps only the correct ones.
+                """)
+
+                with gr.Row():
+                    auto_match_enabled = gr.Checkbox(
+                        label="Enable Auto Face Match",
+                        value=True,
+                        info="Automatically detect and match faces by embedding similarity (no manual index needed)"
+                    )
+                    auto_match_threshold = gr.Slider(
+                        minimum=0.0,
+                        maximum=0.8,
+                        step=0.05,
+                        value=0.20,
+                        label="Match Similarity Threshold",
+                        info="Minimum cosine similarity to accept a match (lower = more permissive, 0.3+ = strict)"
+                    )
+
+                with gr.Row():
+                    with gr.Column():
+                        source_image_2 = gr.Image(
+                            label="Additional Source Face 2 (optional)",
+                            type="pil",
+                            interactive=True
+                        )
+                    with gr.Column():
+                        source_image_3 = gr.Image(
+                            label="Additional Source Face 3 (optional)",
+                            type="pil",
+                            interactive=True
+                        )
+
+                gr.Markdown("""
+                **How it works:**
+                - Detects ALL faces in source image(s) and target image
+                - Computes 512-dim ArcFace embedding for each face
+                - Calculates cosine similarity between every source↔target pair
+                - Uses Hungarian algorithm for globally optimal 1:1 assignment
+                - Swaps only matched pairs above the similarity threshold
+                
+                **Use cases:**
+                - **1 source, multi-target**: Only the best-matching target face gets swapped
+                - **Multi-source, multi-target**: Each source auto-matched to its best target
+                - **Additional sources**: Upload extra face images for multi-person swapping
+                
+                **Threshold guide:** 0.0 = always match, 0.2 = permissive, 0.4 = moderate, 0.6+ = strict same-person only
+                """)
+
             # ── Adaptive Pipeline block ──────────────────────────────────────
             with gr.Accordion("⚙️ Adaptive Pipeline (Auto-Tune)", open=False):
                 with gr.Row():
@@ -237,9 +315,11 @@ class ReactorV3Script(scripts.Script):
             - GPEN-512: Fast, good quality (full body shots)
             - GPEN-1024: Slower, maximum quality (portraits)
             - Auto-resolution recommended for best speed/quality balance
+            - **Auto Face Match**: Enable to skip manual face index — automatic embedding-based matching!
             - **Smart Match**: Automatically swaps only matching gender (e.g., female source → female target)
             - **Gender Filter**: Use M/F to swap only male or female faces regardless of source
             - **Aggressive Cleanup**: Enable if you have limited VRAM (<12GB) for consistent speed
+            - **Multi-person swap**: Upload additional source faces in Auto Face Match section
             
             **📁 Model Location:** `extensions/sd-webui-reactor-v3/models/facerestore_models/`
             """)
@@ -254,6 +334,10 @@ class ReactorV3Script(scripts.Script):
         return [
             enabled, source_image, source_face_index, target_face_index,
             restore_model, gender_match, auto_resolution, aggressive_cleanup,
+            occlusion_enabled, occlusion_strength, occlusion_sensitivity,
+            # auto face match controls
+            auto_match_enabled, auto_match_threshold,
+            source_image_2, source_image_3,
             # adaptive controls
             adaptive_enabled, adaptive_max_retries, adaptive_confidence_threshold,
             adaptive_color_match, adaptive_swap_strength, adaptive_restore_strength,
@@ -265,6 +349,10 @@ class ReactorV3Script(scripts.Script):
                          enabled, source_image, source_face_index,
                          target_face_index, restore_model, gender_match,
                          auto_resolution, aggressive_cleanup,
+                         occlusion_enabled, occlusion_strength, occlusion_sensitivity,
+                         # auto face match params
+                         auto_match_enabled=True, auto_match_threshold=0.20,
+                         source_image_2=None, source_image_3=None,
                          # adaptive params
                          adaptive_enabled=False, adaptive_max_retries=1,
                          adaptive_confidence_threshold=0.30,
@@ -278,13 +366,50 @@ class ReactorV3Script(scripts.Script):
         Supports both classic mode and new adaptive pipeline mode.
         """
         if not enabled:
+            print("[ReActor V3] Skipped - checkbox is not enabled")
             return
         if source_image is None:
+            print("[ReActor V3] Skipped - no source image provided")
             return
-        if restore_model == 'None' and not adaptive_enabled:
+        if restore_model == 'None' and not adaptive_enabled and not auto_match_enabled:
+            print("[ReActor V3] Skipped - no restore model selected and adaptive/auto-match disabled")
             return
 
         try:
+            print("")
+            print("[ReActor V3] ========================================")
+            print("[ReActor V3]   POST-PROCESS IMAGE TRIGGERED")
+            print("[ReActor V3] ========================================")
+            total_start = time.time()
+            
+            # Log all settings
+            print(f"[ReActor V3]   Auto Face Match: {auto_match_enabled}")
+            if auto_match_enabled:
+                print(f"[ReActor V3]   Match threshold: {auto_match_threshold}")
+                has_extra_src = source_image_2 is not None or source_image_3 is not None
+                print(f"[ReActor V3]   Additional sources: {has_extra_src}")
+            else:
+                print(f"[ReActor V3]   Source face index: {source_face_index}")
+                print(f"[ReActor V3]   Target face index: {target_face_index}")
+            print(f"[ReActor V3]   Restore model: {restore_model}")
+            print(f"[ReActor V3]   Gender match: {gender_match}")
+            print(f"[ReActor V3]   Auto resolution: {auto_resolution}")
+            print(f"[ReActor V3]   Aggressive cleanup: {aggressive_cleanup}")
+            print(f"[ReActor V3]   Occlusion: enabled={occlusion_enabled}, strength={occlusion_strength}, sensitivity={occlusion_sensitivity}")
+            print(f"[ReActor V3]   Adaptive pipeline: {adaptive_enabled}")
+            if adaptive_enabled:
+                print(f"[ReActor V3]   Adaptive max retries: {adaptive_max_retries}")
+                print(f"[ReActor V3]   Adaptive confidence threshold: {adaptive_confidence_threshold}")
+                print(f"[ReActor V3]   Adaptive color match: {adaptive_color_match}")
+                print(f"[ReActor V3]   Adaptive swap strength: {adaptive_swap_strength}")
+                print(f"[ReActor V3]   Adaptive restore strength: {adaptive_restore_strength}")
+                print(f"[ReActor V3]   Adaptive sharpen: {adaptive_sharpen}")
+                print(f"[ReActor V3]   Adaptive texture blend: {adaptive_texture_blend}")
+            
+            if torch.cuda.is_available():
+                vram_alloc = torch.cuda.memory_allocated() / (1024**3)
+                vram_res = torch.cuda.memory_reserved() / (1024**3)
+                print(f"[ReActor V3]   VRAM at start - Allocated: {vram_alloc:.2f} GB, Reserved: {vram_res:.2f} GB")
             # ── Resolve paths & engine ──────────────────────────────────
             script_dir    = os.path.dirname(os.path.abspath(__file__))
             extension_dir = os.path.dirname(script_dir)
@@ -294,14 +419,61 @@ class ReactorV3Script(scripts.Script):
 
             engine = get_reactor_v3_engine(models_path)
             engine.set_cleanup_mode(aggressive_cleanup)
+            engine.set_occlusion_handling(
+                enabled=bool(occlusion_enabled),
+                strength=float(occlusion_strength),
+                sensitivity=float(occlusion_sensitivity),
+            )
 
             source_cv2 = pil_to_cv2(source_image)
             target_cv2 = pil_to_cv2(pp.image)
             if source_cv2 is None or target_cv2 is None:
+                print("[ReActor V3]   ERROR: Failed to convert images to CV2 format")
                 return
+            
+            print(f"[ReActor V3]   Source CV2: {source_cv2.shape[1]}x{source_cv2.shape[0]} ({source_cv2.dtype})")
+            print(f"[ReActor V3]   Target CV2: {target_cv2.shape[1]}x{target_cv2.shape[0]} ({target_cv2.dtype})")
+            
+            # Analyze source vs target color/brightness for mismatch warning
+            src_mean = np.mean(source_cv2, axis=(0,1))
+            tgt_mean = np.mean(target_cv2, axis=(0,1))
+            src_brightness = float(np.mean(cv2.cvtColor(source_cv2, cv2.COLOR_BGR2GRAY)))
+            tgt_brightness = float(np.mean(cv2.cvtColor(target_cv2, cv2.COLOR_BGR2GRAY)))
+            print(f"[ReActor V3]   Source mean color (BGR): [{src_mean[0]:.1f}, {src_mean[1]:.1f}, {src_mean[2]:.1f}], brightness: {src_brightness:.1f}")
+            print(f"[ReActor V3]   Target mean color (BGR): [{tgt_mean[0]:.1f}, {tgt_mean[1]:.1f}, {tgt_mean[2]:.1f}], brightness: {tgt_brightness:.1f}")
+            brightness_diff = abs(src_brightness - tgt_brightness)
+            if brightness_diff > 30:
+                print(f"[ReActor V3]   \u26a0 BRIGHTNESS MISMATCH between source ({src_brightness:.0f}) and target ({tgt_brightness:.0f}): diff={brightness_diff:.0f}")
+            color_diff = np.mean(np.abs(src_mean - tgt_mean))
+            if color_diff > 25:
+                print(f"[ReActor V3]   \u26a0 COLOR TONE MISMATCH between source and target: avg_diff={color_diff:.1f}")
 
             # ─────────────────────────────────────────────────────────────
-            if adaptive_enabled:
+            if auto_match_enabled:
+                # ── AUTO FACE MATCH PIPELINE PATH ────────────────────────
+                # Collect additional source images
+                additional_sources = []
+                for extra_src in [source_image_2, source_image_3]:
+                    if extra_src is not None:
+                        extra_cv2 = pil_to_cv2(extra_src)
+                        if extra_cv2 is not None:
+                            additional_sources.append(extra_cv2)
+                
+                effective_restore = restore_model if restore_model != 'None' else None
+                
+                print(f"[ReActor V3] Running Auto Face Match Pipeline...")
+                print(f"[ReActor V3]   Primary source + {len(additional_sources)} additional source(s)")
+                result_cv2, status = engine.process_auto_match(
+                    source_img           = source_cv2,
+                    target_img           = target_cv2,
+                    restore_model        = effective_restore,
+                    gender_match         = gender_match,
+                    similarity_threshold = float(auto_match_threshold),
+                    additional_sources   = additional_sources if additional_sources else None,
+                )
+                print(f"[ReActor V3] {status}")
+            
+            elif adaptive_enabled:
                 # ── ADAPTIVE PIPELINE PATH ───────────────────────────────
                 import reactor_v3_adaptive as _adp
 
@@ -363,6 +535,16 @@ class ReactorV3Script(scripts.Script):
             result_pil = cv2_to_pil(result_cv2)
             if result_pil is not None:
                 pp.image = result_pil
+                print(f"[ReActor V3]   Output image replaced: {result_pil.size[0]}x{result_pil.size[1]}")
+            
+            total_elapsed = time.time() - total_start
+            if torch.cuda.is_available():
+                vram_alloc = torch.cuda.memory_allocated() / (1024**3)
+                vram_res = torch.cuda.memory_reserved() / (1024**3)
+                print(f"[ReActor V3]   VRAM at end - Allocated: {vram_alloc:.2f} GB, Reserved: {vram_res:.2f} GB")
+            print(f"[ReActor V3]   Total postprocess time: {total_elapsed:.3f}s")
+            print("[ReActor V3] ========================================")
+            print("")
 
         except Exception as e:
             print(f"[ReActor V3] Error in postprocess_image: {e}")

@@ -17,8 +17,6 @@ Usage (standalone):
     result_img, report = pipeline.run(source_img, target_img, ...)
 """
 
-from __future__ import annotations
-
 import math
 import dataclasses
 from dataclasses import dataclass, field
