@@ -196,6 +196,29 @@ class ReactorV3Script(scripts.Script):
                     info="Higher sensitivity catches more potential occluders"
                 )
 
+            with gr.Row():
+                mouth_protect_enabled = gr.Checkbox(
+                    label="Mouth Protection",
+                    value=True,
+                    info="Preserve original mouth region when target has open mouth (prevents pixelation)"
+                )
+                mouth_protect_strength = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=0.75,
+                    label="Mouth Protect Strength",
+                    info="How strongly to blend original mouth back (higher = more original mouth kept)"
+                )
+                mouth_open_threshold = gr.Slider(
+                    minimum=0.05,
+                    maximum=0.60,
+                    step=0.01,
+                    value=0.28,
+                    label="Mouth Open Threshold",
+                    info="Mouth-open ratio above which protection activates (lower = trigger earlier)"
+                )
+
             # ── Auto Face Match block ─────────────────────────────────────────
             with gr.Accordion("🎯 Auto Face Match (Embedding-Based)", open=False):
                 gr.Markdown("""
@@ -335,6 +358,8 @@ class ReactorV3Script(scripts.Script):
             enabled, source_image, source_face_index, target_face_index,
             restore_model, gender_match, auto_resolution, aggressive_cleanup,
             occlusion_enabled, occlusion_strength, occlusion_sensitivity,
+            # mouth protection controls
+            mouth_protect_enabled, mouth_protect_strength, mouth_open_threshold,
             # auto face match controls
             auto_match_enabled, auto_match_threshold,
             source_image_2, source_image_3,
@@ -350,6 +375,9 @@ class ReactorV3Script(scripts.Script):
                          target_face_index, restore_model, gender_match,
                          auto_resolution, aggressive_cleanup,
                          occlusion_enabled, occlusion_strength, occlusion_sensitivity,
+                         # mouth protection params
+                         mouth_protect_enabled=True, mouth_protect_strength=0.75,
+                         mouth_open_threshold=0.28,
                          # auto face match params
                          auto_match_enabled=True, auto_match_threshold=0.20,
                          source_image_2=None, source_image_3=None,
@@ -396,6 +424,7 @@ class ReactorV3Script(scripts.Script):
             print(f"[ReActor V3]   Auto resolution: {auto_resolution}")
             print(f"[ReActor V3]   Aggressive cleanup: {aggressive_cleanup}")
             print(f"[ReActor V3]   Occlusion: enabled={occlusion_enabled}, strength={occlusion_strength}, sensitivity={occlusion_sensitivity}")
+            print(f"[ReActor V3]   Mouth protection: enabled={mouth_protect_enabled}, strength={mouth_protect_strength}, threshold={mouth_open_threshold}")
             print(f"[ReActor V3]   Adaptive pipeline: {adaptive_enabled}")
             if adaptive_enabled:
                 print(f"[ReActor V3]   Adaptive max retries: {adaptive_max_retries}")
@@ -423,6 +452,11 @@ class ReactorV3Script(scripts.Script):
                 enabled=bool(occlusion_enabled),
                 strength=float(occlusion_strength),
                 sensitivity=float(occlusion_sensitivity),
+            )
+            engine.set_mouth_protection(
+                enabled=bool(mouth_protect_enabled),
+                strength=float(mouth_protect_strength),
+                threshold=float(mouth_open_threshold),
             )
 
             source_cv2 = pil_to_cv2(source_image)

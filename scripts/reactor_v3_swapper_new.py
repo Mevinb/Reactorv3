@@ -103,12 +103,21 @@ class ReActorV3:
         self.occlusion_strength = 1.0
         self.occlusion_sensitivity = 0.55
         
+        # Mouth preservation settings
+        self.mouth_protect_enabled = True
+        self.mouth_protect_strength = 0.75  # How strongly to blend original mouth back (0-1)
+        self.mouth_open_threshold = 0.28     # Mouth-open ratio above which preservation kicks in
+        
         print(f"[ReActor V3] InsightFace path: {self.insightface_path}")
         print(f"[ReActor V3] GPEN models path: {self.facerestore_path}")
         print(f"[ReActor V3] Auto VRAM cleanup: {self.auto_cleanup} (aggressive={self.aggressive_cleanup})")
         print(
             f"[ReActor V3] Adaptive occlusion: enabled={self.occlusion_enabled}, "
             f"strength={self.occlusion_strength:.2f}, sensitivity={self.occlusion_sensitivity:.2f}"
+        )
+        print(
+            f"[ReActor V3] Mouth protection: enabled={self.mouth_protect_enabled}, "
+            f"strength={self.mouth_protect_strength:.2f}, threshold={self.mouth_open_threshold:.2f}"
         )
     
     def initialize_face_analyser(self):
@@ -530,6 +539,13 @@ class ReActorV3:
                 elapsed = time.time() - t0
                 print(f"[ReActor V3]     Swap completed in {elapsed:.3f}s")
                 
+                # Mouth preservation per face
+                if self.mouth_protect_enabled:
+                    mouth_ratio, mouth_is_open = self._detect_mouth_open(target_face, original_for_occlusion)
+                    if mouth_is_open:
+                        print(f"[ReActor V3]     ⚠ Open mouth on Target[{tgt_idx}] (ratio={mouth_ratio:.3f}) — preserving")
+                        result = self._preserve_mouth_region(original_for_occlusion, result, target_face, mouth_ratio)
+                
                 # Occlusion preservation per face
                 result = self._preserve_foreground_occlusions(
                     original_for_occlusion, result, target_face, stage=f"auto-swap-{mi}"
@@ -578,6 +594,279 @@ class ReActorV3:
             return target_img, f"Error: {str(e)}"
 
     # ── End Auto Face Match Methods ──────────────────────────────────────────
+
+    def set_mouth_protection(self, enabled: bool, strength: float = 0.75, threshold: float = 0.28):
+        """Configure mouth-region preservation for open-mouth targets."""
+        self.mouth_protect_enabled = bool(enabled)
+        self.mouth_protect_strength = float(np.clip(strength, 0.0, 1.0))
+        self.mouth_open_threshold = float(np.clip(threshold, 0.05, 0.70))
+        print(
+            f"[ReActor V3] Mouth protection set: enabled={self.mouth_protect_enabled}, "
+            f"strength={self.mouth_protect_strength:.2f}, threshold={self.mouth_open_threshold:.2f}"
+        )
+
+    # ── Mouth Detection & Preservation ────────────────────────────────────────
+
+    def _detect_mouth_open(self, face, img: np.ndarray) -> Tuple[float, bool]:
+        """
+        Detect whether a face has its mouth open using multi-signal analysis.
+
+        InsightFace buffalo_l provides 5 key-points (kps):
+          [0] left_eye, [1] right_eye, [2] nose, [3] mouth_left, [4] mouth_right
+
+        Additionally, if the model provides 68/106/478 landmarks we use the
+        actual lip landmarks for much better accuracy.
+
+        Strategy (5-kps fallback):
+          - Estimate mouth center from mean of mouth_left + mouth_right
+          - Measure vertical gap between nose tip and mouth center
+          - Normalise by inter-eye distance (robust to face scale / distance)
+          - Cross-check with a local texture analysis: open mouths have a
+            dark cavity between the lips → high intensity variance in a
+            small strip below the midpoint of the two mouth corners.
+
+        Returns:
+            (mouth_open_ratio, is_open)  where ratio is 0-1 normalised.
+        """
+        threshold = self.mouth_open_threshold
+
+        # ── Try detailed landmarks first (68-pt / 106-pt / 478-pt) ────────
+        landmark_2d = getattr(face, 'landmark_2d_106', None)
+        if landmark_2d is None:
+            landmark_2d = getattr(face, 'landmark_3d_68', None)
+        if landmark_2d is None:
+            landmark_2d = getattr(face, 'landmark_2d_68', None)
+
+        if landmark_2d is not None:
+            lm = np.asarray(landmark_2d, dtype=np.float32)
+            if lm.ndim == 2:
+                if lm.shape[0] >= 106:
+                    # 106-point model: upper lip 76, lower lip 86 (approx)
+                    upper_lip = lm[82]  # centre-top of upper lip
+                    lower_lip = lm[87]  # centre-bottom of lower lip
+                    left_eye = lm[35]
+                    right_eye = lm[93]
+                elif lm.shape[0] >= 68:
+                    # 68-point model: inner lip points 61-67
+                    upper_lip = lm[62]  # top of inner upper lip
+                    lower_lip = lm[66]  # bottom of inner lower lip
+                    left_eye = lm[36]
+                    right_eye = lm[45]
+                else:
+                    upper_lip = lower_lip = left_eye = right_eye = None
+
+                if upper_lip is not None:
+                    lip_gap = float(np.linalg.norm(lower_lip[:2] - upper_lip[:2]))
+                    eye_dist = float(np.linalg.norm(right_eye[:2] - left_eye[:2]))
+                    if eye_dist < 1.0:
+                        eye_dist = 1.0
+                    ratio = lip_gap / eye_dist
+                    is_open = ratio > threshold
+                    print(
+                        f"[ReActor V3]   Mouth (landmark): lip_gap={lip_gap:.1f}px, "
+                        f"eye_dist={eye_dist:.1f}px, ratio={ratio:.3f}, "
+                        f"open={'YES' if is_open else 'no'} (thr={threshold:.2f})"
+                    )
+                    return ratio, is_open
+
+        # ── Fallback: 5 key-points + texture analysis ─────────────────────
+        kps = getattr(face, 'kps', None)
+        if kps is None or len(kps) < 5:
+            return 0.0, False
+
+        kps = np.asarray(kps, dtype=np.float32)
+        left_eye, right_eye = kps[0], kps[1]
+        nose = kps[2]
+        mouth_l, mouth_r = kps[3], kps[4]
+
+        eye_dist = float(np.linalg.norm(right_eye - left_eye))
+        if eye_dist < 1.0:
+            eye_dist = 1.0
+
+        mouth_center = (mouth_l + mouth_r) / 2.0
+        nose_to_mouth = float(np.linalg.norm(mouth_center - nose))
+
+        # Geometric ratio: nose-to-mouth / inter-eye distance
+        geom_ratio = nose_to_mouth / eye_dist
+
+        # Texture check: sample a small patch below the mouth centre
+        # Open mouths show a dark cavity → low mean pixel value + high variance
+        texture_bonus = 0.0
+        try:
+            h, w = img.shape[:2]
+            mx, my = int(mouth_center[0]), int(mouth_center[1])
+            half_w = max(4, int(eye_dist * 0.15))
+            half_h = max(3, int(eye_dist * 0.10))
+            # Sample just below the mouth corner midpoint
+            py1 = max(0, my)
+            py2 = min(h, my + half_h * 2)
+            px1 = max(0, mx - half_w)
+            px2 = min(w, mx + half_w)
+            if py2 > py1 and px2 > px1:
+                patch = img[py1:py2, px1:px2]
+                if patch.size > 0:
+                    gray_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
+                    mean_val = float(np.mean(gray_patch))
+                    std_val = float(np.std(gray_patch))
+                    # Dark interior (< 80) with moderate variation → open mouth
+                    if mean_val < 80 and std_val > 15:
+                        texture_bonus = 0.08
+                    elif mean_val < 100 and std_val > 20:
+                        texture_bonus = 0.04
+        except Exception:
+            pass
+
+        ratio = geom_ratio + texture_bonus
+        is_open = ratio > threshold
+        print(
+            f"[ReActor V3]   Mouth (5-kps): nose_to_mouth={nose_to_mouth:.1f}px, "
+            f"eye_dist={eye_dist:.1f}px, geom={geom_ratio:.3f}, tex_bonus={texture_bonus:.3f}, "
+            f"ratio={ratio:.3f}, open={'YES' if is_open else 'no'} (thr={threshold:.2f})"
+        )
+        return ratio, is_open
+
+    def _build_mouth_mask(self, face, image_shape: Tuple[int, int, int],
+                          mouth_ratio: float = 0.0) -> Optional[np.ndarray]:
+        """
+        Build a soft feathered mask covering the mouth region.
+
+        Uses detailed landmarks when available; falls back to 5-kps estimation.
+        The mask size adapts to how open the mouth is (larger opening → bigger mask).
+
+        Returns:
+            Float32 mask [0-1] same H×W as image, or None on failure.
+        """
+        img_h, img_w = image_shape[:2]
+
+        # ── Try detailed landmarks ────────────────────────────────────────
+        landmark_2d = getattr(face, 'landmark_2d_106', None)
+        if landmark_2d is None:
+            landmark_2d = getattr(face, 'landmark_3d_68', None)
+        if landmark_2d is None:
+            landmark_2d = getattr(face, 'landmark_2d_68', None)
+
+        mouth_pts = None
+        if landmark_2d is not None:
+            lm = np.asarray(landmark_2d, dtype=np.float32)
+            if lm.ndim == 2:
+                if lm.shape[0] >= 106:
+                    # 106-pt: outer lip 52-71, inner 72-91 (approx range)
+                    mouth_pts = lm[52:92, :2].copy()
+                elif lm.shape[0] >= 68:
+                    # 68-pt: outer lip 48-59, inner 60-67
+                    mouth_pts = lm[48:68, :2].copy()
+
+        # ── Fallback: estimate from 5 key-points ─────────────────────────
+        if mouth_pts is None:
+            kps = getattr(face, 'kps', None)
+            if kps is None or len(kps) < 5:
+                return None
+            kps = np.asarray(kps, dtype=np.float32)
+            mouth_l, mouth_r = kps[3], kps[4]
+            nose = kps[2]
+            eye_dist = float(np.linalg.norm(kps[1] - kps[0]))
+            if eye_dist < 1.0:
+                eye_dist = 1.0
+
+            cx = (mouth_l[0] + mouth_r[0]) / 2.0
+            cy = (mouth_l[1] + mouth_r[1]) / 2.0
+            half_w = max(8, (mouth_r[0] - mouth_l[0]) / 2.0 * 1.3)
+            # Vertical extent grows with mouth openness
+            open_extra = max(0.0, mouth_ratio - 0.15) * eye_dist * 1.5
+            half_h = max(6, eye_dist * 0.18 + open_extra)
+
+            # Build an ellipse of sample points
+            angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+            mouth_pts = np.stack([
+                cx + half_w * np.cos(angles),
+                cy + half_h * np.sin(angles),
+            ], axis=1).astype(np.float32)
+
+        if mouth_pts is None or len(mouth_pts) < 3:
+            return None
+
+        # Expand slightly for safety margin
+        centroid = mouth_pts.mean(axis=0)
+        mouth_pts_expanded = centroid + (mouth_pts - centroid) * 1.25
+
+        hull = cv2.convexHull(mouth_pts_expanded.astype(np.int32))
+        mask = np.zeros((img_h, img_w), dtype=np.float32)
+        cv2.fillConvexPoly(mask, hull, 1.0)
+
+        # Dilate to cover surrounding skin that also gets distorted
+        bbox = face.bbox if hasattr(face, 'bbox') else None
+        if bbox is not None:
+            face_w = max(1, int(bbox[2] - bbox[0]))
+            face_h = max(1, int(bbox[3] - bbox[1]))
+        else:
+            face_w, face_h = img_w // 4, img_h // 4
+        dilate_px = max(5, int(min(face_w, face_h) * 0.08))
+        kernel = np.ones((dilate_px, dilate_px), dtype=np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        # Feather the edges for seamless blending
+        feather = max(11, int(min(face_w, face_h) * 0.15))
+        if feather % 2 == 0:
+            feather += 1
+        mask = cv2.GaussianBlur(mask, (feather, feather), feather * 0.35)
+        mask = np.clip(mask, 0.0, 1.0)
+
+        return mask
+
+    def _preserve_mouth_region(self,
+                                original_img: np.ndarray,
+                                swapped_img: np.ndarray,
+                                target_face,
+                                mouth_ratio: float = 0.0) -> np.ndarray:
+        """
+        When the target face has an open mouth, blend the original mouth region
+        back into the swapped result to prevent pixelation / distortion.
+
+        The blend strength is adaptive:
+          - Slightly open  (ratio ~0.28-0.40): gentle blend (0.3-0.5)
+          - Wide open       (ratio >0.50):     strong blend (up to full strength)
+
+        This preserves the original mouth interior (teeth, tongue, cavity) while
+        keeping the rest of the swapped face intact.
+        """
+        if not self.mouth_protect_enabled:
+            return swapped_img
+        if original_img is None or swapped_img is None or target_face is None:
+            return swapped_img
+        if original_img.shape != swapped_img.shape:
+            return swapped_img
+
+        mouth_mask = self._build_mouth_mask(target_face, swapped_img.shape, mouth_ratio)
+        if mouth_mask is None:
+            return swapped_img
+
+        if float(np.max(mouth_mask)) < 0.01:
+            return swapped_img
+
+        # Adaptive strength: scale with how open the mouth is
+        base_strength = self.mouth_protect_strength
+        openness_factor = min(1.0, max(0.0, (mouth_ratio - self.mouth_open_threshold) / 0.25))
+        # Ramp from ~40% of base at threshold to 100% at threshold+0.25
+        effective_strength = base_strength * (0.4 + 0.6 * openness_factor)
+        effective_strength = float(np.clip(effective_strength, 0.0, 1.0))
+
+        # Blend original mouth back into swapped image
+        orig_f = original_img.astype(np.float32)
+        swap_f = swapped_img.astype(np.float32)
+        mask_3ch = (mouth_mask * effective_strength)[:, :, None]
+
+        blended = swap_f * (1.0 - mask_3ch) + orig_f * mask_3ch
+        result = np.clip(blended, 0, 255).astype(np.uint8)
+
+        coverage_pct = float(np.mean(mouth_mask > 0.05)) * 100
+        print(
+            f"[ReActor V3]   Mouth preserved: ratio={mouth_ratio:.3f}, "
+            f"effective_strength={effective_strength:.2f}, "
+            f"coverage={coverage_pct:.1f}% of image"
+        )
+        return result
+
+    # ── End Mouth Preservation ────────────────────────────────────────────────
 
     def set_cleanup_mode(self, aggressive: bool):
         """Set whether cleanup should be aggressive (unload all models)"""
@@ -989,6 +1278,13 @@ class ReActorV3:
             result = self.face_swapper.get(target_img, target_face, source_face, paste_back=True)
             swap_elapsed = time.time() - t0
             print(f"[ReActor V3]   Face swap completed in {swap_elapsed:.3f}s")
+            
+            # Mouth preservation: detect open mouth → blend original mouth back
+            if self.mouth_protect_enabled:
+                mouth_ratio, mouth_is_open = self._detect_mouth_open(target_face, target_img)
+                if mouth_is_open:
+                    print(f"[ReActor V3]   ⚠ Open mouth detected (ratio={mouth_ratio:.3f}) — preserving mouth region")
+                    result = self._preserve_mouth_region(target_img, result, target_face, mouth_ratio)
             
             # Compute swap difference stats
             diff = cv2.absdiff(target_img, result)
