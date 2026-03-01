@@ -199,12 +199,12 @@ class GPENFaceRestorer:
         print(f"[ReActor V3] GPEN   Inference completed in {infer_elapsed:.3f}s")
         print(f"[ReActor V3] GPEN   Output range before clip: [{output_range_before_clip[0]:.3f}, {output_range_before_clip[1]:.3f}]")
         
-        # CRITICAL FIX: Clamp GPEN output to [-1, 1] range
-        restored_np = np.clip(restored_np, -1.0, 1.0)
+        # Step 7: Soft tanh compression instead of hard clip — prevents banding artifacts
+        restored_np = np.tanh(restored_np)
         
         output_range_after_clip = (float(np.min(restored_np)), float(np.max(restored_np)))
-        if output_range_before_clip != output_range_after_clip:
-            print(f"[ReActor V3] GPEN   ⚠ Values were clipped! After clip: [{output_range_after_clip[0]:.3f}, {output_range_after_clip[1]:.3f}]")
+        if output_range_before_clip[0] < -1.0 or output_range_before_clip[1] > 1.0:
+            print(f"[ReActor V3] GPEN   ⚠ Values soft-compressed with tanh. After: [{output_range_after_clip[0]:.3f}, {output_range_after_clip[1]:.3f}]")
         
         # Compute face difference metrics
         diff = np.abs(restored_np - face_np)

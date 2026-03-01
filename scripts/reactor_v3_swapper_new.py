@@ -563,39 +563,48 @@ class ReActorV3:
             if restore_model and restore_model.lower() != 'none':
                 if self.load_restorer(restore_model):
                     if self.current_restorer:
-                        print(f"[ReActor V3] ── Restoring with {restore_model} ──")
-                        t0 = time.time()
-                        restored = self.current_restorer.restore(result)
-                        elapsed = time.time() - t0
-                        print(f"[ReActor V3]   Restoration completed in {elapsed:.3f}s")
-                        
-                        # Identity-aware + resolution-aware harmonization per face (Sections B, F)
-                        print("[ReActor V3] ── Identity-Aware Harmonization (Auto-Match) ──")
-                        swapped_emb = self._get_face_embedding(result)
-                        restored_emb = self._get_face_embedding(restored)
+                        # ── Steps 2–3: Conditional GPEN gate (auto-match) ──
+                        _gate_face = swapped_target_faces[0] if swapped_target_faces else None
+                        _run_gpen_batch = (not _gate_face) or self._should_run_gpen(result, _gate_face)
+                        if not _run_gpen_batch:
+                            print("[ReActor V3]   GPEN skipped — applying mild adaptive sharpen (auto-match)")
+                            _prim_src_face = all_source_faces[0] if all_source_faces else None
+                            if _gate_face:
+                                result = self._mild_adaptive_sharpen(result, _gate_face, source_img, _prim_src_face)
+                        else:
+                            print(f"[ReActor V3] ── Restoring with {restore_model} ──")
+                            t0 = time.time()
+                            restored = self.current_restorer.restore(result)
+                            elapsed = time.time() - t0
+                            print(f"[ReActor V3]   Restoration completed in {elapsed:.3f}s")
 
-                        for mi_h, tf in enumerate(swapped_target_faces):
-                            src_face_h = all_source_faces[matches[mi_h][0]] if mi_h < len(matches) else None
-                            src_emb_h = src_face_h.embedding if (src_face_h and hasattr(src_face_h, 'embedding')) else None
+                            # Identity-aware + resolution-aware harmonization per face (Sections B, F)
+                            print("[ReActor V3] ── Identity-Aware Harmonization (Auto-Match) ──")
+                            swapped_emb = self._get_face_embedding(result)
+                            restored_emb = self._get_face_embedding(restored)
 
-                            id_weight = compute_identity_restore_weight(
-                                src_emb_h, swapped_emb, restored_emb, base_restore_weight=0.8
-                            )
-                            res_limit = compute_resolution_restore_limit(
-                                tf.bbox if hasattr(tf, 'bbox') else None
-                            )
-                            eff_weight = min(id_weight, res_limit)
-                            restored = self._harmonize_restored_face(
-                                result, restored, tf, override_restore_weight=eff_weight,
-                            )
-                        
-                        # Final occlusion preservation for each face
-                        for mi, tf in enumerate(swapped_target_faces):
-                            restored = self._preserve_foreground_occlusions(
-                                original_for_occlusion, restored, tf, stage=f"auto-restore-{mi}"
-                            )
-                        
-                        result = restored
+                            for mi_h, tf in enumerate(swapped_target_faces):
+                                src_face_h = all_source_faces[matches[mi_h][0]] if mi_h < len(matches) else None
+                                src_emb_h = src_face_h.embedding if (src_face_h and hasattr(src_face_h, 'embedding')) else None
+
+                                id_weight = compute_identity_restore_weight(
+                                    src_emb_h, swapped_emb, restored_emb, base_restore_weight=0.4
+                                )
+                                res_limit = compute_resolution_restore_limit(
+                                    tf.bbox if hasattr(tf, 'bbox') else None
+                                )
+                                eff_weight = min(id_weight, res_limit, 0.45)  # Step 4: hard cap
+                                restored = self._harmonize_restored_face(
+                                    result, restored, tf, override_restore_weight=eff_weight,
+                                )
+
+                            # Final occlusion preservation for each face
+                            for mi, tf in enumerate(swapped_target_faces):
+                                restored = self._preserve_foreground_occlusions(
+                                    original_for_occlusion, restored, tf, stage=f"auto-restore-{mi}"
+                                )
+
+                            result = restored
             
             # ── Adaptive Face Enhancement (replaces static face fix) ──
             if self.auto_face_fix:
@@ -1169,15 +1178,16 @@ class ReActorV3:
         restored_detail = self._texture_energy(restored_img, face_mask)
 
         if swapped_detail <= 1e-6:
-            return 0.85, 1.0
+            return 0.4, 1.0
 
         detail_ratio = restored_detail / swapped_detail
-        restore_weight = 1.0
+        restore_weight = 0.4  # Step 4: reduced base restore weight
         if detail_ratio > 1.08:
-            # If restored face is much sharper than base image, pull it back slightly.
-            restore_weight = max(0.65, 1.0 - 0.55 * (detail_ratio - 1.0))
+            # Pull back further when restoration adds excessive sharpness
+            restore_weight = max(0.2, 0.4 - 0.3 * (detail_ratio - 1.0))
 
-        return float(np.clip(restore_weight, 0.65, 1.0)), float(detail_ratio)
+        restore_weight = min(restore_weight, 0.45)  # Step 4: hard cap
+        return float(np.clip(restore_weight, 0.2, 0.45)), float(detail_ratio)
 
     def _get_face_embedding(self, img: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -1199,6 +1209,113 @@ class ReActorV3:
         except Exception as e:
             print(f"[ReActor V3] Could not extract embedding: {e}")
         return None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Conditional GPEN gate helpers  (streak-artifact fix)
+    # ─────────────────────────────────────────────────────────────────────
+
+    RESTORE_THRESHOLD = 120  # Laplacian variance below this → face is soft → OK to restore
+
+    def _face_lap_var(self, img: np.ndarray, face) -> float:
+        """Laplacian variance of the face bbox region in *img*."""
+        if not hasattr(face, 'bbox') or face.bbox is None:
+            return 0.0
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        return float(cv2.Laplacian(gray.astype(np.float64), cv2.CV_64F).var())
+
+    def _should_run_gpen(self, swapped_img: np.ndarray, face) -> bool:
+        """
+        Step 2 + Step 3: Decide whether GPEN restoration is needed.
+
+        GPEN runs ONLY when both conditions are met:
+          • Laplacian variance < RESTORE_THRESHOLD  (face genuinely soft)
+          • Face bbox size <= 300 px  (large sharp faces generate streak artifacts)
+        """
+        face_size = 0
+        if hasattr(face, 'bbox') and face.bbox is not None:
+            x1, y1, x2, y2 = face.bbox
+            face_size = max(abs(float(x2) - float(x1)), abs(float(y2) - float(y1)))
+
+        # Step 3: Resolution guard
+        if face_size > 300:
+            print(f"[ReActor V3] GPEN skip: face_size={face_size:.0f}px > 300 — large face, no restore")
+            return False
+
+        # Step 2: Sharpness guard
+        lap_var = self._face_lap_var(swapped_img, face)
+        if lap_var >= self.RESTORE_THRESHOLD:
+            print(f"[ReActor V3] GPEN skip: lap_var={lap_var:.1f} >= {self.RESTORE_THRESHOLD} — already sharp")
+            return False
+
+        print(f"[ReActor V3] GPEN run: lap_var={lap_var:.1f} < {self.RESTORE_THRESHOLD}, face_size={face_size:.0f}px")
+        return True
+
+    def _mild_adaptive_sharpen(
+        self,
+        swapped_img: np.ndarray,
+        target_face,
+        source_img: np.ndarray = None,
+        source_face=None,
+    ) -> np.ndarray:
+        """
+        Step 6: Proportional mild unsharp mask on the face region.
+        Replaces heavy GPEN when restoration is skipped.
+
+        gain = min((1 - hf_ratio) * 0.2, 0.15),  sigma=0.8
+        No sharpening when hf_ratio >= 0.9.
+        """
+        if not hasattr(target_face, 'bbox'):
+            return swapped_img
+
+        x1, y1, x2, y2 = [int(v) for v in target_face.bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(swapped_img.shape[1], x2), min(swapped_img.shape[0], y2)
+        swap_crop = swapped_img[y1:y2, x1:x2]
+        if swap_crop.size == 0:
+            return swapped_img
+
+        # Compute reference (source face) HF energy
+        hf_ref = None
+        if source_img is not None and source_face is not None and hasattr(source_face, 'bbox'):
+            sx1, sy1, sx2, sy2 = [int(v) for v in source_face.bbox]
+            sx1, sy1 = max(0, sx1), max(0, sy1)
+            sx2, sy2 = min(source_img.shape[1], sx2), min(source_img.shape[0], sy2)
+            src_crop = source_img[sy1:sy2, sx1:sx2]
+            if src_crop.size > 0:
+                gray_src = cv2.cvtColor(src_crop, cv2.COLOR_BGR2GRAY) if src_crop.ndim == 3 else src_crop
+                hf_ref = float(cv2.Laplacian(gray_src.astype(np.float64), cv2.CV_64F).var())
+
+        gray_swap = cv2.cvtColor(swap_crop, cv2.COLOR_BGR2GRAY) if swap_crop.ndim == 3 else swap_crop
+        hf_swap = float(cv2.Laplacian(gray_swap.astype(np.float64), cv2.CV_64F).var())
+
+        if hf_ref is not None and hf_ref > 1e-3:
+            hf_ratio = hf_swap / hf_ref
+            if hf_ratio >= 0.9:
+                return swapped_img  # already close enough to reference
+            gain = min((1.0 - hf_ratio) * 0.2, 0.15)
+        else:
+            # Fallback: absolute threshold-based gain
+            gain = min(max(0.0, (self.RESTORE_THRESHOLD - hf_swap) / (self.RESTORE_THRESHOLD * 10.0)), 0.15)
+            hf_ratio = hf_swap / max(self.RESTORE_THRESHOLD, 1)
+
+        if gain < 0.005:
+            return swapped_img
+
+        crop_f = swap_crop.astype(np.float32)
+        blurred = cv2.GaussianBlur(crop_f, (0, 0), sigmaX=0.8)
+        detail = crop_f - blurred
+        sharpened = np.clip(crop_f + detail * gain, 0, 255).astype(np.uint8)
+
+        result = swapped_img.copy()
+        result[y1:y2, x1:x2] = sharpened
+        print(f"[ReActor V3] Mild adaptive sharpen: hf_ratio={hf_ratio:.3f}, gain={gain:.3f}")
+        return result
 
     def _harmonize_restored_face(self, swapped_img: np.ndarray, restored_img: np.ndarray,
                                   target_face, override_restore_weight: float = None) -> np.ndarray:
@@ -1377,6 +1494,21 @@ class ReActorV3:
                         vram_before = torch.cuda.memory_allocated() / (1024**3)
                         print(f"[ReActor V3]   VRAM before restore: {vram_before:.2f} GB")
                     
+                    # ── Steps 2–3: Conditional GPEN — skip for sharp/large faces ──
+                    if not self._should_run_gpen(result, target_face):
+                        print("[ReActor V3]   GPEN skipped — applying mild adaptive sharpen instead")
+                        result = self._mild_adaptive_sharpen(result, target_face, source_img, source_face)
+                        if self.auto_face_fix:
+                            print("[ReActor V3] ── Adaptive Face Enhancement ──")
+                            result = auto_fix_face(
+                                reference_img=source_img, output_img=result,
+                                face_analyser=self.face_analyser,
+                                target_img=target_img, source_face=source_face,
+                            )
+                        if self.auto_cleanup:
+                            self.cleanup_memory(aggressive=self.aggressive_cleanup)
+                        return result, "Swapped (GPEN skipped — face already sharp/large)"
+
                     t0_restore = time.time()
                     restored_result = self.current_restorer.restore(result)
                     restore_elapsed = time.time() - t0_restore
@@ -1427,12 +1559,12 @@ class ReActorV3:
                     restored_emb = self._get_face_embedding(restored_result)
 
                     identity_weight = compute_identity_restore_weight(
-                        source_emb, swapped_emb, restored_emb, base_restore_weight=0.8
+                        source_emb, swapped_emb, restored_emb, base_restore_weight=0.4
                     )
                     res_limit = compute_resolution_restore_limit(
                         target_face.bbox if hasattr(target_face, 'bbox') else None
                     )
-                    effective_weight = min(identity_weight, res_limit)
+                    effective_weight = min(identity_weight, res_limit, 0.45)  # Step 4: hard cap
                     print(f"[ReActor V3]   Effective restore weight: {effective_weight:.3f} "
                           f"(identity={identity_weight:.3f}, res_limit={res_limit:.2f})")
 

@@ -409,10 +409,17 @@ def compute_identity_restore_weight(
 
     identity_penalty = _sigmoid(-delta_sim * 10)
     restore_weight = base_restore_weight * (1.0 - identity_penalty)
+
+    # Step 5: Hard identity-drift check — halve weight if similarity drops >0.02
+    if delta_sim < -0.02:
+        restore_weight *= 0.5
+        print(f"[FaceFixer] Identity drift detected (delta={delta_sim:.3f} < -0.02) — halving restore weight")
+
+    # Hard cap at 0.45 to prevent over-restoration
     restore_weight = float(np.clip(
         restore_weight,
         ADAPTIVE_CONFIG["restore_min"],
-        ADAPTIVE_CONFIG["restore_max"],
+        min(ADAPTIVE_CONFIG["restore_max"], 0.45),
     ))
 
     print(
