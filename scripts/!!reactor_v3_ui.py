@@ -219,6 +219,13 @@ class ReactorV3Script(scripts.Script):
                     info="Mouth-open ratio above which protection activates (lower = trigger earlier)"
                 )
 
+            with gr.Row():
+                auto_face_fix = gr.Checkbox(
+                    label="\u2728 Auto Face Detail Fix",
+                    value=True,
+                    info="Automatically match output face sharpness/texture to reference — no manual tuning needed"
+                )
+
             # ── Auto Face Match block ─────────────────────────────────────────
             with gr.Accordion("🎯 Auto Face Match (Embedding-Based)", open=False):
                 gr.Markdown("""
@@ -342,8 +349,7 @@ class ReactorV3Script(scripts.Script):
             - **Smart Match**: Automatically swaps only matching gender (e.g., female source → female target)
             - **Gender Filter**: Use M/F to swap only male or female faces regardless of source
             - **Aggressive Cleanup**: Enable if you have limited VRAM (<12GB) for consistent speed
-            - **Multi-person swap**: Upload additional source faces in Auto Face Match section
-            
+            - **Multi-person swap**: Upload additional source faces in Auto Face Match section            - **Auto Face Detail Fix**: Compares reference face detail to output and auto-corrects sharpness/texture            
             **📁 Model Location:** `extensions/sd-webui-reactor-v3/models/facerestore_models/`
             """)
             
@@ -360,6 +366,8 @@ class ReactorV3Script(scripts.Script):
             occlusion_enabled, occlusion_strength, occlusion_sensitivity,
             # mouth protection controls
             mouth_protect_enabled, mouth_protect_strength, mouth_open_threshold,
+            # auto face fix
+            auto_face_fix,
             # auto face match controls
             auto_match_enabled, auto_match_threshold,
             source_image_2, source_image_3,
@@ -378,6 +386,8 @@ class ReactorV3Script(scripts.Script):
                          # mouth protection params
                          mouth_protect_enabled=True, mouth_protect_strength=0.75,
                          mouth_open_threshold=0.28,
+                         # auto face fix
+                         auto_face_fix=True,
                          # auto face match params
                          auto_match_enabled=True, auto_match_threshold=0.20,
                          source_image_2=None, source_image_3=None,
@@ -425,6 +435,7 @@ class ReactorV3Script(scripts.Script):
             print(f"[ReActor V3]   Aggressive cleanup: {aggressive_cleanup}")
             print(f"[ReActor V3]   Occlusion: enabled={occlusion_enabled}, strength={occlusion_strength}, sensitivity={occlusion_sensitivity}")
             print(f"[ReActor V3]   Mouth protection: enabled={mouth_protect_enabled}, strength={mouth_protect_strength}, threshold={mouth_open_threshold}")
+            print(f"[ReActor V3]   Auto face detail fix: {auto_face_fix}")
             print(f"[ReActor V3]   Adaptive pipeline: {adaptive_enabled}")
             if adaptive_enabled:
                 print(f"[ReActor V3]   Adaptive max retries: {adaptive_max_retries}")
@@ -458,6 +469,7 @@ class ReactorV3Script(scripts.Script):
                 strength=float(mouth_protect_strength),
                 threshold=float(mouth_open_threshold),
             )
+            engine.set_auto_face_fix(bool(auto_face_fix))
 
             source_cv2 = pil_to_cv2(source_image)
             target_cv2 = pil_to_cv2(pp.image)

@@ -77,6 +77,11 @@ except ImportError:
     print("[ReActor V3] WARNING: WebUI memory management not available, using basic cleanup")
 
 from reactor_v3_gpen_restorer_new import get_gpen_restorer, get_available_gpen_models, clear_gpen_cache
+from reactor_v3_face_fixer import (
+    auto_fix_face,
+    compute_identity_restore_weight,
+    compute_resolution_restore_limit,
+)
 
 
 class ReActorV3:
@@ -99,6 +104,7 @@ class ReActorV3:
         # Auto cleanup settings
         self.auto_cleanup = True  # Automatically free VRAM after processing
         self.aggressive_cleanup = True  # Unload all models (default True for memory-constrained systems)
+        self.auto_face_fix = True  # Automatically fix face sharpness/texture to match reference
         self.occlusion_enabled = True
         self.occlusion_strength = 1.0
         self.occlusion_sensitivity = 0.55
@@ -111,6 +117,7 @@ class ReActorV3:
         print(f"[ReActor V3] InsightFace path: {self.insightface_path}")
         print(f"[ReActor V3] GPEN models path: {self.facerestore_path}")
         print(f"[ReActor V3] Auto VRAM cleanup: {self.auto_cleanup} (aggressive={self.aggressive_cleanup})")
+        print(f"[ReActor V3] Auto face fix (match reference detail): {self.auto_face_fix}")
         print(
             f"[ReActor V3] Adaptive occlusion: enabled={self.occlusion_enabled}, "
             f"strength={self.occlusion_strength:.2f}, sensitivity={self.occlusion_sensitivity:.2f}"
@@ -562,9 +569,25 @@ class ReActorV3:
                         elapsed = time.time() - t0
                         print(f"[ReActor V3]   Restoration completed in {elapsed:.3f}s")
                         
-                        # Harmonize each swapped face region
-                        for tf in swapped_target_faces:
-                            restored = self._harmonize_restored_face(result, restored, tf)
+                        # Identity-aware + resolution-aware harmonization per face (Sections B, F)
+                        print("[ReActor V3] ── Identity-Aware Harmonization (Auto-Match) ──")
+                        swapped_emb = self._get_face_embedding(result)
+                        restored_emb = self._get_face_embedding(restored)
+
+                        for mi_h, tf in enumerate(swapped_target_faces):
+                            src_face_h = all_source_faces[matches[mi_h][0]] if mi_h < len(matches) else None
+                            src_emb_h = src_face_h.embedding if (src_face_h and hasattr(src_face_h, 'embedding')) else None
+
+                            id_weight = compute_identity_restore_weight(
+                                src_emb_h, swapped_emb, restored_emb, base_restore_weight=0.8
+                            )
+                            res_limit = compute_resolution_restore_limit(
+                                tf.bbox if hasattr(tf, 'bbox') else None
+                            )
+                            eff_weight = min(id_weight, res_limit)
+                            restored = self._harmonize_restored_face(
+                                result, restored, tf, override_restore_weight=eff_weight,
+                            )
                         
                         # Final occlusion preservation for each face
                         for mi, tf in enumerate(swapped_target_faces):
@@ -574,6 +597,22 @@ class ReActorV3:
                         
                         result = restored
             
+            # ── Adaptive Face Enhancement (replaces static face fix) ──
+            if self.auto_face_fix:
+                print("[ReActor V3] ── Adaptive Face Enhancement (Auto-Match) ──")
+                t0_fix = time.time()
+                # Use the first source face for identity anchor
+                primary_source_face = all_source_faces[0] if all_source_faces else None
+                result = auto_fix_face(
+                    reference_img=source_img,
+                    output_img=result,
+                    face_analyser=self.face_analyser,
+                    target_img=target_img,
+                    source_face=primary_source_face,
+                )
+                fix_elapsed = time.time() - t0_fix
+                print(f"[ReActor V3]   Adaptive face enhancement completed in {fix_elapsed:.3f}s")
+
             # ── Cleanup ──
             if self.auto_cleanup:
                 self.cleanup_memory(aggressive=self.aggressive_cleanup)
@@ -868,6 +907,11 @@ class ReActorV3:
 
     # ── End Mouth Preservation ────────────────────────────────────────────────
 
+    def set_auto_face_fix(self, enabled: bool):
+        """Enable/disable automatic face quality fix (match reference detail)."""
+        self.auto_face_fix = bool(enabled)
+        print(f"[ReActor V3] Auto face fix set to: {self.auto_face_fix}")
+
     def set_cleanup_mode(self, aggressive: bool):
         """Set whether cleanup should be aggressive (unload all models)"""
         self.aggressive_cleanup = aggressive
@@ -1135,10 +1179,32 @@ class ReActorV3:
 
         return float(np.clip(restore_weight, 0.65, 1.0)), float(detail_ratio)
 
-    def _harmonize_restored_face(self, swapped_img: np.ndarray, restored_img: np.ndarray, target_face) -> np.ndarray:
+    def _get_face_embedding(self, img: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Run face detection on an image and return the embedding of the largest face.
+        Used for identity-aware restore weight computation.
+        """
+        if self.face_analyser is None:
+            return None
+        try:
+            faces = self.face_analyser.get(img)
+            if faces:
+                best = max(
+                    faces,
+                    key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                    if hasattr(f, 'bbox') else 0
+                )
+                if hasattr(best, 'embedding') and best.embedding is not None:
+                    return best.embedding
+        except Exception as e:
+            print(f"[ReActor V3] Could not extract embedding: {e}")
+        return None
+
+    def _harmonize_restored_face(self, swapped_img: np.ndarray, restored_img: np.ndarray,
+                                  target_face, override_restore_weight: float = None) -> np.ndarray:
         """
         Blend restored face back into the swapped image with adaptive strength and seam cleanup.
-        This keeps face detail natural relative to body/detail level and reduces edge artifacts.
+        Uses identity-aware override weight when provided (Section B + F).
         """
         if swapped_img is None or restored_img is None:
             return restored_img
@@ -1152,7 +1218,13 @@ class ReActorV3:
         swapped_f = swapped_img.astype(np.float32)
         restored_f = restored_img.astype(np.float32)
 
-        restore_weight, detail_ratio = self._get_adaptive_restore_weight(swapped_img, restored_img, mask)
+        # Use identity-aware weight if provided, otherwise fall back to texture-based
+        if override_restore_weight is not None:
+            restore_weight = override_restore_weight
+            detail_ratio = 0.0  # Not computed when overridden
+        else:
+            restore_weight, detail_ratio = self._get_adaptive_restore_weight(swapped_img, restored_img, mask)
+
         harmonized = cv2.addWeighted(restored_f, restore_weight, swapped_f, 1.0 - restore_weight, 0.0)
 
         mask_3ch = mask[:, :, None]
@@ -1348,9 +1420,28 @@ class ReActorV3:
                                     else:
                                         print(f"[ReActor V3]   ✓ Color consistency OK: avg diff={total_mismatch:.1f}")
                     
+                    # ── Identity-Aware + Resolution-Aware Restore Weight (Sections B, F) ──
+                    print(f"[ReActor V3] ── Computing Identity-Aware Restore Weight ──")
+                    source_emb = source_face.embedding if hasattr(source_face, 'embedding') else None
+                    swapped_emb = self._get_face_embedding(result)
+                    restored_emb = self._get_face_embedding(restored_result)
+
+                    identity_weight = compute_identity_restore_weight(
+                        source_emb, swapped_emb, restored_emb, base_restore_weight=0.8
+                    )
+                    res_limit = compute_resolution_restore_limit(
+                        target_face.bbox if hasattr(target_face, 'bbox') else None
+                    )
+                    effective_weight = min(identity_weight, res_limit)
+                    print(f"[ReActor V3]   Effective restore weight: {effective_weight:.3f} "
+                          f"(identity={identity_weight:.3f}, res_limit={res_limit:.2f})")
+
                     print(f"[ReActor V3] ── Harmonizing Restored Face ──")
                     t0_harm = time.time()
-                    restored_result = self._harmonize_restored_face(result, restored_result, target_face)
+                    restored_result = self._harmonize_restored_face(
+                        result, restored_result, target_face,
+                        override_restore_weight=effective_weight,
+                    )
                     harm_elapsed = time.time() - t0_harm
                     print(f"[ReActor V3]   Harmonization completed in {harm_elapsed:.3f}s")
                     
@@ -1358,6 +1449,20 @@ class ReActorV3:
                         target_img, restored_result, target_face, stage="post-restore"
                     )
                     
+                    # ── Adaptive Face Enhancement (replaces static face fix) ──
+                    if self.auto_face_fix:
+                        print("[ReActor V3] ── Adaptive Face Enhancement ──")
+                        t0_fix = time.time()
+                        restored_result = auto_fix_face(
+                            reference_img=source_img,
+                            output_img=restored_result,
+                            face_analyser=self.face_analyser,
+                            target_img=target_img,
+                            source_face=source_face,
+                        )
+                        fix_elapsed = time.time() - t0_fix
+                        print(f"[ReActor V3]   Adaptive face enhancement completed in {fix_elapsed:.3f}s")
+
                     # Final quality metrics
                     if hasattr(target_face, 'bbox'):
                         bx1, by1, bx2, by2 = [int(v) for v in target_face.bbox]
