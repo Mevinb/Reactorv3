@@ -301,10 +301,10 @@ class GPENFaceRestorer:
         gpen_lin = np.power(np.clip(gpen_f32, 0.0, 1.0), 2.2)
 
         # ── Steps 4-5: Extract Low-Frequency layers ─────────────────────
-        # sigma=1.5 → tighter LF band → preserves more mid-frequency detail
-        sigma       = 1.5
-        low_swapped = cv2.GaussianBlur(face_lin, (0, 0), sigmaX=sigma)
-        low_gpen    = cv2.GaussianBlur(gpen_lin, (0, 0), sigmaX=sigma)
+        # sigma_lf=1.4 → reduced from 1.5 to retain more mid-frequency detail
+        sigma_lf    = 1.4
+        low_swapped = cv2.GaussianBlur(face_lin, (0, 0), sigmaX=sigma_lf)
+        low_gpen    = cv2.GaussianBlur(gpen_lin, (0, 0), sigmaX=sigma_lf)
 
         # ── Step 5: Extract High-Frequency components ───────────────────
         hf_swapped = face_lin - low_swapped
@@ -313,6 +313,13 @@ class GPENFaceRestorer:
         # ── Step 6: Compute HF delta (GPEN's added micro-detail only) ───
         hf_delta = hf_gpen - hf_swapped
 
+        # ── Step 6b: Spatial normalization of HF delta ──────────────────
+        # Prevents center over-sharpening and cheek under-sharpening.
+        hf_strength  = np.mean(np.abs(hf_delta), axis=2, keepdims=True)
+        hf_norm      = hf_delta / (hf_strength + 1e-6)
+        target_strength = np.mean(hf_strength)
+        hf_balanced  = hf_norm * target_strength
+
         # ── Step 7: Adaptive alpha injection ────────────────────────────
         # Alpha scales with how much extra HF GPEN actually added.
         # High ratio (face already has strong HF) → lower alpha.
@@ -320,17 +327,17 @@ class GPENFaceRestorer:
         hf_energy_face = float(np.mean(np.abs(hf_swapped)))
         hf_energy_gpen = float(np.mean(np.abs(hf_gpen)))
         ratio          = hf_energy_face / (hf_energy_gpen + 1e-6)
-        alpha          = float(np.clip(0.35 * (1.0 - ratio), 0.15, 0.45))
+        alpha          = float(np.clip(0.35 * (1.0 - ratio), 0.2, 0.4))
         print(
             f"[ReActor V3] GPEN HF adaptive alpha: "
             f"hf_face={hf_energy_face:.5f}, hf_gpen={hf_energy_gpen:.5f}, "
             f"ratio={ratio:.3f} → alpha={alpha:.3f}"
         )
 
-        enhanced_lin = face_lin + alpha * hf_delta
+        enhanced_lin = face_lin + alpha * hf_balanced
 
         # ── Step 8: Light post-smoothing to prevent ringing ─────────────
-        enhanced_lin = cv2.GaussianBlur(enhanced_lin, (3, 3), 0.3)
+        enhanced_lin = cv2.GaussianBlur(enhanced_lin, (3, 3), 0.2)
 
         # ── Convert linear → sRGB ────────────────────────────────────────
         enhanced_lin = np.clip(enhanced_lin, 0.0, 1.0)
