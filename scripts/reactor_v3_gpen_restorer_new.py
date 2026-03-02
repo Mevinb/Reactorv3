@@ -349,6 +349,69 @@ class GPENFaceRestorer:
         clamped      = np.tanh(centered)
         enhanced_512 = (clamped + 1.0) * 0.5
 
+        # ── Multi-Scale Mid-Frequency Enhancement ────────────────────────
+        # Final perceptual clarity stage: amplifies the mid-frequency band
+        # (facial detail / edges) and lightly boosts fine texture without
+        # halos, skin noise, or structural change.
+        # Operates in float32 [0, 1] in sRGB space after soft clamp.
+        ms_face = enhanced_512.astype(np.float32)
+
+        # Build two Gaussian blur levels
+        ms_g1 = cv2.GaussianBlur(ms_face, (0, 0), 1.0)   # near-low pass
+        ms_g2 = cv2.GaussianBlur(ms_face, (0, 0), 2.5)   # true low pass
+
+        # Decompose into frequency bands
+        ms_low  = ms_g2                # lighting + structure (untouched)
+        ms_mid  = ms_g1 - ms_g2       # clarity band: edges, skin planes
+        ms_high = ms_face - ms_g1     # fine micro-texture
+
+        # Amplify bands (do NOT exceed 1.5 / 1.15)
+        mid_boost  = 1.35
+        high_boost = 1.1
+        ms_enhanced = ms_low + ms_mid * mid_boost + ms_high * high_boost
+
+        # Soft clamp reconstructed image back to [0, 1]
+        ms_centered  = ms_enhanced * 2.0 - 1.0
+        ms_clamped   = np.tanh(ms_centered)
+        enhanced_512 = (ms_clamped + 1.0) * 0.5
+
+        # ── Nonlinear Local Laplacian Clarity Enhancement ─────────────────
+        # Operates in LAB space on L channel only — no halo, no noise boost,
+        # no global contrast shift. tanh remapping expands mid-band contrast
+        # nonlinearly, preserving skin smoothness and color (A/B untouched).
+        ll_face_u8  = np.clip(enhanced_512 * 255.0, 0, 255).astype(np.uint8)
+        ll_lab      = cv2.cvtColor(ll_face_u8, cv2.COLOR_BGR2LAB).astype(np.float32) / 255.0
+
+        ll_L = ll_lab[:, :, 0]
+
+        # Gaussian pyramid — two scales
+        ll_g1 = cv2.GaussianBlur(ll_L, (0, 0), 1.0)   # fine scale
+        ll_g2 = cv2.GaussianBlur(ll_L, (0, 0), 2.5)   # coarse scale
+
+        # Frequency bands
+        ll_low  = ll_g2            # lighting / structure — leave untouched
+        ll_mid  = ll_g1 - ll_g2   # perceptual clarity band
+        ll_high = ll_L - ll_g1    # micro-texture
+
+        # Nonlinear tanh remapping of mid band (avoids over-boost at edges)
+        clarity_strength = 0.6     # tune: 0.4 (soft) → 0.8 (max)
+        tanh_s           = float(np.tanh(clarity_strength))
+        ll_mid_enhanced  = np.tanh(ll_mid * clarity_strength) / (tanh_s + 1e-8)
+
+        # Mild compression of high band to avoid crispiness
+        ll_high_enhanced = ll_high * 1.05   # do NOT exceed 1.1
+
+        # Reconstruct L channel
+        ll_L_enhanced = ll_low + ll_mid_enhanced + ll_high_enhanced
+        ll_L_enhanced = np.clip(ll_L_enhanced, 0.0, 1.0)
+
+        # Merge enhanced L with original A/B, convert back to BGR float32 [0,1]
+        ll_lab[:, :, 0] = ll_L_enhanced
+        ll_bgr_u8       = cv2.cvtColor(
+            np.clip(ll_lab * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR
+        )
+        enhanced_512    = ll_bgr_u8.astype(np.float32) / 255.0
+
         # ── Step 9: Downscale back to original bbox size ─────────────────
         enhanced_face = cv2.resize(enhanced_512, (bbox_w, bbox_h),
                                    interpolation=cv2.INTER_AREA)
