@@ -220,6 +220,160 @@ class GPENFaceRestorer:
         
         return restored_t
     
+    def enhance_face_region(self, full_img: np.ndarray, face_bbox) -> np.ndarray:
+        """
+        High-frequency detail enhancer for a single face region.
+
+        Replaces full-face GPEN replacement with HF delta injection:
+          Crop face → Upscale 512 → GPEN → Extract HF delta → Inject into original
+          → Downscale → Feathered composite
+
+        GPEN output is NEVER blended directly.  Only its additional high-frequency
+        detail (relative to the swapped face) is injected back.
+
+        Args:
+            full_img:  Full BGR uint8 image.
+            face_bbox: [x1, y1, x2, y2] bounding box of the swapped face.
+
+        Returns:
+            Enhanced full image in BGR uint8 (same resolution as input).
+        """
+        t0 = time.time()
+        img_h, img_w = full_img.shape[:2]
+
+        # Parse + clamp bbox
+        x1, y1, x2, y2 = [int(v) for v in face_bbox]
+        x1 = max(0, min(x1, img_w - 1))
+        y1 = max(0, min(y1, img_h - 1))
+        x2 = max(x1 + 1, min(x2, img_w))
+        y2 = max(y1 + 1, min(y2, img_h))
+        bbox_w, bbox_h = x2 - x1, y2 - y1
+
+        if bbox_w < 8 or bbox_h < 8:
+            print(f"[ReActor V3] GPEN HF: bbox too small ({bbox_w}x{bbox_h}), skipping")
+            return full_img
+
+        # ── Step 1: Crop face region ────────────────────────────────────
+        face_crop = full_img[y1:y2, x1:x2].copy()
+
+        # ── Step 2: Upscale to 512x512 with Lanczos (improves GPEN response) ──
+        face_512 = cv2.resize(face_crop, (512, 512), interpolation=cv2.INTER_LANCZOS4)
+
+        # ── Step 3: Convert to float32 [0, 1] ──────────────────────────
+        face_f32 = face_512.astype(np.float32) / 255.0
+
+        # Prepare GPEN input: BGR→RGB, [0,1]→[-1,1], HWC→NCHW
+        face_rgb  = face_f32[:, :, ::-1].copy()
+        face_norm = face_rgb * 2.0 - 1.0
+
+        if self.resolution != 512:
+            face_norm_r = cv2.resize(face_norm, (self.resolution, self.resolution),
+                                     interpolation=cv2.INTER_LANCZOS4)
+        else:
+            face_norm_r = face_norm
+
+        face_nchw = face_norm_r.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+
+        # ── Step 4 (part of Step 3): Run GPEN inference ─────────────────
+        input_name  = self.session.get_inputs()[0].name
+        output_name = self.session.get_outputs()[0].name
+
+        t_infer = time.time()
+        gpen_out_nchw = self.session.run(
+            [output_name], {input_name: face_nchw}
+        )[0]
+        infer_elapsed = time.time() - t_infer
+        print(f"[ReActor V3] GPEN HF inference: {infer_elapsed:.3f}s")
+
+        # Convert GPEN output back to BGR float32 [0, 1]
+        # NCHW → HWC, RGB → BGR, [-1,1] → [0,1]
+        gpen_hwc  = gpen_out_nchw[0].transpose(1, 2, 0)
+        gpen_bgr  = gpen_hwc[:, :, ::-1].copy()
+        gpen_f32  = (gpen_bgr + 1.0) * 0.5
+
+        # Ensure both arrays are 512x512 (model may output different res)
+        if gpen_f32.shape[:2] != (512, 512):
+            gpen_f32 = cv2.resize(gpen_f32, (512, 512), interpolation=cv2.INTER_LANCZOS4)
+
+        # ── Convert sRGB → linear space for unbiased HF arithmetic ─────
+        # Gamma-corrected sRGB biases HF separation; linear space is correct.
+        face_lin = np.power(np.clip(face_f32, 0.0, 1.0), 2.2)
+        gpen_lin = np.power(np.clip(gpen_f32, 0.0, 1.0), 2.2)
+
+        # ── Steps 4-5: Extract Low-Frequency layers ─────────────────────
+        # sigma=1.5 → tighter LF band → preserves more mid-frequency detail
+        sigma       = 1.5
+        low_swapped = cv2.GaussianBlur(face_lin, (0, 0), sigmaX=sigma)
+        low_gpen    = cv2.GaussianBlur(gpen_lin, (0, 0), sigmaX=sigma)
+
+        # ── Step 5: Extract High-Frequency components ───────────────────
+        hf_swapped = face_lin - low_swapped
+        hf_gpen    = gpen_lin - low_gpen
+
+        # ── Step 6: Compute HF delta (GPEN's added micro-detail only) ───
+        hf_delta = hf_gpen - hf_swapped
+
+        # ── Step 7: Adaptive alpha injection ────────────────────────────
+        # Alpha scales with how much extra HF GPEN actually added.
+        # High ratio (face already has strong HF) → lower alpha.
+        # Prevents over-injection on already-decent faces.
+        hf_energy_face = float(np.mean(np.abs(hf_swapped)))
+        hf_energy_gpen = float(np.mean(np.abs(hf_gpen)))
+        ratio          = hf_energy_face / (hf_energy_gpen + 1e-6)
+        alpha          = float(np.clip(0.35 * (1.0 - ratio), 0.15, 0.45))
+        print(
+            f"[ReActor V3] GPEN HF adaptive alpha: "
+            f"hf_face={hf_energy_face:.5f}, hf_gpen={hf_energy_gpen:.5f}, "
+            f"ratio={ratio:.3f} → alpha={alpha:.3f}"
+        )
+
+        enhanced_lin = face_lin + alpha * hf_delta
+
+        # ── Step 8: Light post-smoothing to prevent ringing ─────────────
+        enhanced_lin = cv2.GaussianBlur(enhanced_lin, (3, 3), 0.3)
+
+        # ── Convert linear → sRGB ────────────────────────────────────────
+        enhanced_lin = np.clip(enhanced_lin, 0.0, 1.0)
+        enhanced_512 = np.power(enhanced_lin, 1.0 / 2.2)
+
+        # ── Soft clamp via tanh (no aggressive hard clip) ────────────────
+        # Convert [0,1] → [-1,1], apply tanh, back to [0,1]
+        centered     = enhanced_512 * 2.0 - 1.0
+        clamped      = np.tanh(centered)
+        enhanced_512 = (clamped + 1.0) * 0.5
+
+        # ── Step 9: Downscale back to original bbox size ─────────────────
+        enhanced_face = cv2.resize(enhanced_512, (bbox_w, bbox_h),
+                                   interpolation=cv2.INTER_AREA)
+        enhanced_u8   = np.clip(enhanced_face * 255.0, 0, 255).astype(np.uint8)
+
+        # ── Step 10: Feathered composite back to target image ────────────
+        result = full_img.copy()
+
+        mask   = np.zeros((bbox_h, bbox_w), dtype=np.float32)
+        cx, cy = bbox_w // 2, bbox_h // 2
+        ax     = max(2, int(bbox_w * 0.45))
+        ay     = max(2, int(bbox_h * 0.45))
+        cv2.ellipse(mask, (cx, cy), (ax, ay), 0, 0, 360, 1.0, -1)
+        # Scale feather to 8% of bbox — avoids over-blending on small faces.
+        feather = max(5, int(min(bbox_w, bbox_h) * 0.08))
+        if feather % 2 == 0:
+            feather += 1
+        mask = cv2.GaussianBlur(mask, (feather, feather), feather * 0.35)
+        mask = np.clip(mask, 0.0, 1.0)
+
+        region   = result[y1:y2, x1:x2].astype(np.float32)
+        mask_3ch = mask[:, :, None]
+        blended  = enhanced_u8.astype(np.float32) * mask_3ch + region * (1.0 - mask_3ch)
+        result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+
+        elapsed = time.time() - t0
+        print(
+            f"[ReActor V3] GPEN HF enhancement: bbox=({x1},{y1},{x2},{y2}) "
+            f"[{bbox_w}x{bbox_h}] → 512 → [{bbox_w}x{bbox_h}], {elapsed:.3f}s"
+        )
+        return result
+
     def restore(self, np_image: np.ndarray) -> np.ndarray:
         """
         Restore faces in an image using WebUI's FaceRestoreHelper.

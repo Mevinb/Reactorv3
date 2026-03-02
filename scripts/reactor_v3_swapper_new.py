@@ -79,8 +79,6 @@ except ImportError:
 from reactor_v3_gpen_restorer_new import get_gpen_restorer, get_available_gpen_models, clear_gpen_cache
 from reactor_v3_face_fixer import (
     auto_fix_face,
-    compute_identity_restore_weight,
-    compute_resolution_restore_limit,
 )
 
 
@@ -572,40 +570,26 @@ class ReActorV3:
                             if _gate_face:
                                 result = self._mild_adaptive_sharpen(result, _gate_face, source_img, _prim_src_face)
                         else:
-                            print(f"[ReActor V3] ── Restoring with {restore_model} ──")
+                            print(f"[ReActor V3] ── GPEN HF Enhancement with {restore_model} ──")
                             t0 = time.time()
-                            restored = self.current_restorer.restore(result)
-                            elapsed = time.time() - t0
-                            print(f"[ReActor V3]   Restoration completed in {elapsed:.3f}s")
 
-                            # Identity-aware + resolution-aware harmonization per face (Sections B, F)
-                            print("[ReActor V3] ── Identity-Aware Harmonization (Auto-Match) ──")
-                            swapped_emb = self._get_face_embedding(result)
-                            restored_emb = self._get_face_embedding(restored)
-
+                            # Per-face HF delta injection.
+                            # GPEN output is NEVER blended directly —
+                            # only its additional high-frequency detail is injected.
                             for mi_h, tf in enumerate(swapped_target_faces):
-                                src_face_h = all_source_faces[matches[mi_h][0]] if mi_h < len(matches) else None
-                                src_emb_h = src_face_h.embedding if (src_face_h and hasattr(src_face_h, 'embedding')) else None
+                                if hasattr(tf, 'bbox') and tf.bbox is not None:
+                                    result = self.current_restorer.enhance_face_region(
+                                        result, tf.bbox
+                                    )
 
-                                id_weight = compute_identity_restore_weight(
-                                    src_emb_h, swapped_emb, restored_emb, base_restore_weight=0.4
-                                )
-                                res_limit = compute_resolution_restore_limit(
-                                    tf.bbox if hasattr(tf, 'bbox') else None
-                                )
-                                eff_weight = min(id_weight, res_limit, 0.45)  # Step 4: hard cap
-                                restored = self._harmonize_restored_face(
-                                    result, restored, tf, override_restore_weight=eff_weight,
-                                )
+                            elapsed = time.time() - t0
+                            print(f"[ReActor V3]   GPEN HF enhancement completed in {elapsed:.3f}s")
 
-                            # Final occlusion preservation for each face
-                            for mi, tf in enumerate(swapped_target_faces):
-                                restored = self._preserve_foreground_occlusions(
-                                    original_for_occlusion, restored, tf, stage=f"auto-restore-{mi}"
-                                )
-
-                            result = restored
-            
+                        # Final occlusion preservation for each face
+                        for mi, tf in enumerate(swapped_target_faces):
+                            result = self._preserve_foreground_occlusions(
+                                original_for_occlusion, result, tf, stage=f"auto-restore-{mi}"
+                            )
             # ── Adaptive Face Enhancement (replaces static face fix) ──
             if self.auto_face_fix:
                 print("[ReActor V3] ── Adaptive Face Enhancement (Auto-Match) ──")
@@ -1510,73 +1494,19 @@ class ReActorV3:
                         return result, "Swapped (GPEN skipped — face already sharp/large)"
 
                     t0_restore = time.time()
-                    restored_result = self.current_restorer.restore(result)
+
+                    # HF delta injection — GPEN micro-detail only, no full-face replacement.
+                    # Crop face → upscale 512 → GPEN → extract HF delta → inject → downscale → composite.
+                    if hasattr(target_face, 'bbox') and target_face.bbox is not None:
+                        restored_result = self.current_restorer.enhance_face_region(
+                            result, target_face.bbox
+                        )
+                    else:
+                        restored_result = result.copy()
+
                     restore_elapsed = time.time() - t0_restore
-                    print(f"[ReActor V3]   GPEN restoration completed in {restore_elapsed:.3f}s")
-                    
-                    # Compare swapped vs restored to show what restoration changed
-                    restore_diff = cv2.absdiff(result, restored_result)
-                    restore_mean_diff = float(np.mean(restore_diff))
-                    print(f"[ReActor V3]   Restoration diff: mean_change={restore_mean_diff:.2f}")
-                    
-                    # Color analysis: compare face region colors before/after restore
-                    if hasattr(target_face, 'bbox'):
-                        bx1, by1, bx2, by2 = [int(v) for v in target_face.bbox]
-                        bx1, by1 = max(0, bx1), max(0, by1)
-                        bx2, by2 = min(result.shape[1], bx2), min(result.shape[0], by2)
-                        face_before = result[by1:by2, bx1:bx2]
-                        face_after = restored_result[by1:by2, bx1:bx2]
-                        if face_before.size > 0 and face_after.size > 0:
-                            # BGR mean colors
-                            mean_before = np.mean(face_before, axis=(0,1))
-                            mean_after = np.mean(face_after, axis=(0,1))
-                            color_shift = np.abs(mean_after - mean_before)
-                            print(f"[ReActor V3]   Face color (BGR) before restore: [{mean_before[0]:.1f}, {mean_before[1]:.1f}, {mean_before[2]:.1f}]")
-                            print(f"[ReActor V3]   Face color (BGR) after restore:  [{mean_after[0]:.1f}, {mean_after[1]:.1f}, {mean_after[2]:.1f}]")
-                            print(f"[ReActor V3]   Color shift (BGR): [{color_shift[0]:.1f}, {color_shift[1]:.1f}, {color_shift[2]:.1f}]")
-                            
-                            # Also check body vs face color mismatch
-                            # Sample body region (below face)
-                            body_y_start = min(by2, result.shape[0] - 1)
-                            body_y_end = min(by2 + (by2 - by1), result.shape[0])
-                            if body_y_end > body_y_start:
-                                body_region = restored_result[body_y_start:body_y_end, bx1:bx2]
-                                if body_region.size > 0:
-                                    mean_body = np.mean(body_region, axis=(0,1))
-                                    face_body_diff = np.abs(mean_after - mean_body)
-                                    print(f"[ReActor V3]   Body color (BGR) below face:   [{mean_body[0]:.1f}, {mean_body[1]:.1f}, {mean_body[2]:.1f}]")
-                                    print(f"[ReActor V3]   Face-vs-Body color diff (BGR): [{face_body_diff[0]:.1f}, {face_body_diff[1]:.1f}, {face_body_diff[2]:.1f}]")
-                                    total_mismatch = float(np.mean(face_body_diff))
-                                    if total_mismatch > 15:
-                                        print(f"[ReActor V3]   ⚠ COLOR MISMATCH DETECTED: avg diff={total_mismatch:.1f} (threshold=15)")
-                                    else:
-                                        print(f"[ReActor V3]   ✓ Color consistency OK: avg diff={total_mismatch:.1f}")
-                    
-                    # ── Identity-Aware + Resolution-Aware Restore Weight (Sections B, F) ──
-                    print(f"[ReActor V3] ── Computing Identity-Aware Restore Weight ──")
-                    source_emb = source_face.embedding if hasattr(source_face, 'embedding') else None
-                    swapped_emb = self._get_face_embedding(result)
-                    restored_emb = self._get_face_embedding(restored_result)
+                    print(f"[ReActor V3]   GPEN HF enhancement completed in {restore_elapsed:.3f}s")
 
-                    identity_weight = compute_identity_restore_weight(
-                        source_emb, swapped_emb, restored_emb, base_restore_weight=0.4
-                    )
-                    res_limit = compute_resolution_restore_limit(
-                        target_face.bbox if hasattr(target_face, 'bbox') else None
-                    )
-                    effective_weight = min(identity_weight, res_limit, 0.45)  # Step 4: hard cap
-                    print(f"[ReActor V3]   Effective restore weight: {effective_weight:.3f} "
-                          f"(identity={identity_weight:.3f}, res_limit={res_limit:.2f})")
-
-                    print(f"[ReActor V3] ── Harmonizing Restored Face ──")
-                    t0_harm = time.time()
-                    restored_result = self._harmonize_restored_face(
-                        result, restored_result, target_face,
-                        override_restore_weight=effective_weight,
-                    )
-                    harm_elapsed = time.time() - t0_harm
-                    print(f"[ReActor V3]   Harmonization completed in {harm_elapsed:.3f}s")
-                    
                     restored_result = self._preserve_foreground_occlusions(
                         target_img, restored_result, target_face, stage="post-restore"
                     )
