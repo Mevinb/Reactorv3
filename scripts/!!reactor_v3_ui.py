@@ -226,6 +226,39 @@ class ReactorV3Script(scripts.Script):
                     info="Automatically match output face sharpness/texture to reference — no manual tuning needed"
                 )
 
+            # ── Composite & Debug Controls ────────────────────────────────────
+            with gr.Accordion("🔧 Composite Mode & Debug Toggles", open=False):
+                gr.Markdown("""
+                **Single-composite mode** disables redundant blend stages that cause halo/outline artifacts.
+                **Debug toggles** let you isolate which stage introduces artifacts.
+                **Strict fallback** prevents wrong-person swaps when no match passes threshold.
+                """)
+
+                with gr.Row():
+                    composite_mode = gr.Radio(
+                        label="Composite Mode",
+                        choices=[
+                            ("Full Pipeline (swap+GPEN+fix)", "full"),
+                            ("Swap + GPEN only (skip face-fix paste-back)", "swap_gpen"),
+                            ("Swap + Face Fix only (skip GPEN region blend)", "swap_fix"),
+                            ("Swap Only (no post-composites)", "swap_only"),
+                        ],
+                        value="full",
+                        info="Reduce composite stages to eliminate halo/outline artifacts"
+                    )
+
+                with gr.Row():
+                    strict_no_fallback = gr.Checkbox(
+                        label="Strict Match (no fallback swap)",
+                        value=False,
+                        info="When enabled, if no match passes threshold → no swap happens (prevents wrong-person swaps)"
+                    )
+                    redetect_after_swap = gr.Checkbox(
+                        label="Re-detect faces after swap",
+                        value=True,
+                        info="Re-run face detection after swap stage so GPEN/fix use fresh bboxes instead of stale pre-swap ones"
+                    )
+
             # ── Auto Face Match block ─────────────────────────────────────────
             with gr.Accordion("🎯 Auto Face Match (Embedding-Based)", open=False):
                 gr.Markdown("""
@@ -307,7 +340,7 @@ class ReactorV3Script(scripts.Script):
 
                 with gr.Row():
                     adaptive_swap_strength = gr.Slider(
-                        minimum=0.30, maximum=1.00, step=0.05, value=1.00,
+                        minimum=0.00, maximum=1.00, step=0.05, value=0.00,
                         label="Manual Swap Strength Override (0 = auto)",
                         info="0 = fully automatic; any other value locks the swap blend"
                     )
@@ -368,6 +401,8 @@ class ReactorV3Script(scripts.Script):
             mouth_protect_enabled, mouth_protect_strength, mouth_open_threshold,
             # auto face fix
             auto_face_fix,
+            # composite & debug controls
+            composite_mode, strict_no_fallback, redetect_after_swap,
             # auto face match controls
             auto_match_enabled, auto_match_threshold,
             source_image_2, source_image_3,
@@ -388,6 +423,9 @@ class ReactorV3Script(scripts.Script):
                          mouth_open_threshold=0.28,
                          # auto face fix
                          auto_face_fix=True,
+                         # composite & debug params
+                         composite_mode='full', strict_no_fallback=False,
+                         redetect_after_swap=True,
                          # auto face match params
                          auto_match_enabled=True, auto_match_threshold=0.20,
                          source_image_2=None, source_image_3=None,
@@ -413,6 +451,23 @@ class ReactorV3Script(scripts.Script):
             print("[ReActor V3] Skipped - no restore model selected and adaptive/auto-match disabled")
             return
 
+        # ── Mutual exclusion warning: Auto Identity + ReActor ──
+        try:
+            for script_obj in p.scripts.alwayson_scripts:
+                if hasattr(script_obj, 'title') and 'Auto Identity' in script_obj.title():
+                    if hasattr(script_obj, '_enabled') and script_obj._enabled:
+                        print("")
+                        print("[ReActor V3] ⚠⚠⚠ WARNING: Auto Identity SDXL is also ENABLED ⚠⚠⚠")
+                        print("[ReActor V3]   Identity is being conditioned TWICE:")
+                        print("[ReActor V3]     1) During sampling (InstantID cross-attention)")
+                        print("[ReActor V3]     2) During postprocess (ReActor face swap)")
+                        print("[ReActor V3]   This double-injection can amplify artifacts.")
+                        print("[ReActor V3]   Consider disabling one of them for cleaner results.")
+                        print("")
+                        break
+        except Exception:
+            pass  # Don't fail if script introspection fails
+
         try:
             print("")
             print("[ReActor V3] ========================================")
@@ -436,6 +491,9 @@ class ReactorV3Script(scripts.Script):
             print(f"[ReActor V3]   Occlusion: enabled={occlusion_enabled}, strength={occlusion_strength}, sensitivity={occlusion_sensitivity}")
             print(f"[ReActor V3]   Mouth protection: enabled={mouth_protect_enabled}, strength={mouth_protect_strength}, threshold={mouth_open_threshold}")
             print(f"[ReActor V3]   Auto face detail fix: {auto_face_fix}")
+            print(f"[ReActor V3]   Composite mode: {composite_mode}")
+            print(f"[ReActor V3]   Strict no-fallback: {strict_no_fallback}")
+            print(f"[ReActor V3]   Re-detect after swap: {redetect_after_swap}")
             print(f"[ReActor V3]   Adaptive pipeline: {adaptive_enabled}")
             if adaptive_enabled:
                 print(f"[ReActor V3]   Adaptive max retries: {adaptive_max_retries}")
@@ -470,6 +528,9 @@ class ReactorV3Script(scripts.Script):
                 threshold=float(mouth_open_threshold),
             )
             engine.set_auto_face_fix(bool(auto_face_fix))
+            engine.set_composite_mode(str(composite_mode))
+            engine.set_strict_no_fallback(bool(strict_no_fallback))
+            engine.set_redetect_after_swap(bool(redetect_after_swap))
 
             source_cv2 = pil_to_cv2(source_image)
             target_cv2 = pil_to_cv2(pp.image)

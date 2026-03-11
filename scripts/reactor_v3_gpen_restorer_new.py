@@ -301,8 +301,10 @@ class GPENFaceRestorer:
         gpen_lin = np.power(np.clip(gpen_f32, 0.0, 1.0), 2.2)
 
         # ── Steps 4-5: Extract Low-Frequency layers ─────────────────────
-        # sigma_lf=1.4 → reduced from 1.5 to retain more mid-frequency detail
-        sigma_lf    = 1.4
+        # sigma_lf=2.8: captures the 1-3px perceptual-clarity band (the range
+        # that makes a face look sharp vs. AI-blurry). sigma=1.4 was too fine —
+        # it only caught sub-pixel noise, missing inswapper's 128px softness.
+        sigma_lf    = 2.8
         low_swapped = cv2.GaussianBlur(face_lin, (0, 0), sigmaX=sigma_lf)
         low_gpen    = cv2.GaussianBlur(gpen_lin, (0, 0), sigmaX=sigma_lf)
 
@@ -327,7 +329,9 @@ class GPENFaceRestorer:
         hf_energy_face = float(np.mean(np.abs(hf_swapped)))
         hf_energy_gpen = float(np.mean(np.abs(hf_gpen)))
         ratio          = hf_energy_face / (hf_energy_gpen + 1e-6)
-        alpha          = float(np.clip(0.35 * (1.0 - ratio), 0.2, 0.4))
+        # No floor: if face already has equal/more HF than GPEN, inject nothing.
+        # Ceiling raised to 0.55 — blurry inswapper faces need more injection.
+        alpha          = float(np.clip(0.55 * (1.0 - ratio), 0.0, 0.55))
         print(
             f"[ReActor V3] GPEN HF adaptive alpha: "
             f"hf_face={hf_energy_face:.5f}, hf_gpen={hf_energy_gpen:.5f}, "
@@ -336,81 +340,18 @@ class GPENFaceRestorer:
 
         enhanced_lin = face_lin + alpha * hf_balanced
 
-        # ── Step 8: Light post-smoothing to prevent ringing ─────────────
-        enhanced_lin = cv2.GaussianBlur(enhanced_lin, (3, 3), 0.2)
-
         # ── Convert linear → sRGB ────────────────────────────────────────
         enhanced_lin = np.clip(enhanced_lin, 0.0, 1.0)
         enhanced_512 = np.power(enhanced_lin, 1.0 / 2.2)
+        enhanced_512 = np.clip(enhanced_512, 0.0, 1.0).astype(np.float32)
 
-        # ── Soft clamp via tanh (no aggressive hard clip) ────────────────
-        # Convert [0,1] → [-1,1], apply tanh, back to [0,1]
-        centered     = enhanced_512 * 2.0 - 1.0
-        clamped      = np.tanh(centered)
-        enhanced_512 = (clamped + 1.0) * 0.5
-
-        # ── Multi-Scale Mid-Frequency Enhancement ────────────────────────
-        # Final perceptual clarity stage: amplifies the mid-frequency band
-        # (facial detail / edges) and lightly boosts fine texture without
-        # halos, skin noise, or structural change.
-        # Operates in float32 [0, 1] in sRGB space after soft clamp.
-        ms_face = enhanced_512.astype(np.float32)
-
-        # Build two Gaussian blur levels
-        ms_g1 = cv2.GaussianBlur(ms_face, (0, 0), 1.0)   # near-low pass
-        ms_g2 = cv2.GaussianBlur(ms_face, (0, 0), 2.5)   # true low pass
-
-        # Decompose into frequency bands
-        ms_low  = ms_g2                # lighting + structure (untouched)
-        ms_mid  = ms_g1 - ms_g2       # clarity band: edges, skin planes
-        ms_high = ms_face - ms_g1     # fine micro-texture
-
-        # Amplify bands (do NOT exceed 1.5 / 1.15)
-        mid_boost  = 1.35
-        high_boost = 1.1
-        ms_enhanced = ms_low + ms_mid * mid_boost + ms_high * high_boost
-
-        # Soft clamp reconstructed image back to [0, 1]
-        ms_centered  = ms_enhanced * 2.0 - 1.0
-        ms_clamped   = np.tanh(ms_centered)
-        enhanced_512 = (ms_clamped + 1.0) * 0.5
-
-        # ── Nonlinear Local Laplacian Clarity Enhancement ─────────────────
-        # Operates in LAB space on L channel only — no halo, no noise boost,
-        # no global contrast shift. tanh remapping expands mid-band contrast
-        # nonlinearly, preserving skin smoothness and color (A/B untouched).
-        ll_face_u8  = np.clip(enhanced_512 * 255.0, 0, 255).astype(np.uint8)
-        ll_lab      = cv2.cvtColor(ll_face_u8, cv2.COLOR_BGR2LAB).astype(np.float32) / 255.0
-
-        ll_L = ll_lab[:, :, 0]
-
-        # Gaussian pyramid — two scales
-        ll_g1 = cv2.GaussianBlur(ll_L, (0, 0), 1.0)   # fine scale
-        ll_g2 = cv2.GaussianBlur(ll_L, (0, 0), 2.5)   # coarse scale
-
-        # Frequency bands
-        ll_low  = ll_g2            # lighting / structure — leave untouched
-        ll_mid  = ll_g1 - ll_g2   # perceptual clarity band
-        ll_high = ll_L - ll_g1    # micro-texture
-
-        # Nonlinear tanh remapping of mid band (avoids over-boost at edges)
-        clarity_strength = 0.6     # tune: 0.4 (soft) → 0.8 (max)
-        tanh_s           = float(np.tanh(clarity_strength))
-        ll_mid_enhanced  = np.tanh(ll_mid * clarity_strength) / (tanh_s + 1e-8)
-
-        # Mild compression of high band to avoid crispiness
-        ll_high_enhanced = ll_high * 1.05   # do NOT exceed 1.1
-
-        # Reconstruct L channel
-        ll_L_enhanced = ll_low + ll_mid_enhanced + ll_high_enhanced
-        ll_L_enhanced = np.clip(ll_L_enhanced, 0.0, 1.0)
-
-        # Merge enhanced L with original A/B, convert back to BGR float32 [0,1]
-        ll_lab[:, :, 0] = ll_L_enhanced
-        ll_bgr_u8       = cv2.cvtColor(
-            np.clip(ll_lab * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR
-        )
-        enhanced_512    = ll_bgr_u8.astype(np.float32) / 255.0
+        # ── Mild single-pass clarity boost (mid-frequency only) ──────────
+        # Recovers the 2-5px clarity lost at the inswapper 128px bottleneck.
+        # Conservative multipliers (1.15 mid, no high boost) — no halos.
+        _g1 = cv2.GaussianBlur(enhanced_512, (0, 0), 1.2)   # fine-low
+        _g2 = cv2.GaussianBlur(enhanced_512, (0, 0), 3.0)   # coarse-low
+        _mid = _g1 - _g2                                     # clarity band
+        enhanced_512 = np.clip(enhanced_512 + _mid * 0.30, 0.0, 1.0)
 
         # ── Step 9: Downscale back to original bbox size ─────────────────
         enhanced_face = cv2.resize(enhanced_512, (bbox_w, bbox_h),
@@ -425,8 +366,8 @@ class GPENFaceRestorer:
         ax     = max(2, int(bbox_w * 0.45))
         ay     = max(2, int(bbox_h * 0.45))
         cv2.ellipse(mask, (cx, cy), (ax, ay), 0, 0, 360, 1.0, -1)
-        # Scale feather to 8% of bbox — avoids over-blending on small faces.
-        feather = max(5, int(min(bbox_w, bbox_h) * 0.08))
+        # Scale feather to 15% of bbox for smoother compositing.
+        feather = max(7, int(min(bbox_w, bbox_h) * 0.15))
         if feather % 2 == 0:
             feather += 1
         mask = cv2.GaussianBlur(mask, (feather, feather), feather * 0.35)

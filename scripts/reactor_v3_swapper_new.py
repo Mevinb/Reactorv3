@@ -112,6 +112,11 @@ class ReActorV3:
         self.mouth_protect_strength = 0.75  # How strongly to blend original mouth back (0-1)
         self.mouth_open_threshold = 0.28     # Mouth-open ratio above which preservation kicks in
         
+        # Composite mode & debug settings
+        self.composite_mode = 'full'       # 'full', 'swap_gpen', 'swap_fix', 'swap_only'
+        self.strict_no_fallback = False     # If True, no swap when threshold fails
+        self.redetect_after_swap = True     # Re-detect faces after swap for fresh bboxes
+        
         print(f"[ReActor V3] InsightFace path: {self.insightface_path}")
         print(f"[ReActor V3] GPEN models path: {self.facerestore_path}")
         print(f"[ReActor V3] Auto VRAM cleanup: {self.auto_cleanup} (aggressive={self.aggressive_cleanup})")
@@ -445,7 +450,11 @@ class ReActorV3:
             print("[ReActor V3]   Scanning primary source...")
             source_faces = self.get_faces(source_img)
             all_source_faces = list(source_faces) if source_faces else []
-            
+            # Map every source face object → the image it came from.
+            # Uses object identity (id()) so it survives gender-filtering which keeps
+            # the same Python objects rather than copying them.
+            _face_to_src_img = {id(f): source_img for f in all_source_faces}
+
             # Add faces from additional source images
             if additional_sources:
                 for i, add_src in enumerate(additional_sources):
@@ -455,6 +464,8 @@ class ReActorV3:
                         if add_faces:
                             print(f"[ReActor V3]     Found {len(add_faces)} face(s) in additional source {i+1}")
                             all_source_faces.extend(add_faces)
+                            for _af in add_faces:
+                                _face_to_src_img[id(_af)] = add_src
             
             print("[ReActor V3]   Scanning target image...")
             target_faces = self.get_faces(target_img)
@@ -491,6 +502,13 @@ class ReActorV3:
             )
             
             if not matches:
+                if self.strict_no_fallback:
+                    # Strict mode: no swap when threshold fails
+                    msg = "No matches above threshold — strict mode: no swap performed"
+                    print(f"[ReActor V3]   {msg}")
+                    if self.auto_cleanup:
+                        self.cleanup_memory(aggressive=self.aggressive_cleanup)
+                    return target_img, msg
                 # Fallback: if no matches above threshold, use the single best match
                 # This ensures at least one swap happens even with low similarity
                 print("[ReActor V3]   No matches above threshold — using best available pair as fallback")
@@ -516,12 +534,9 @@ class ReActorV3:
             result = target_img.copy()
             original_for_occlusion = target_img.copy()
             
-            # Sort by target face x-position (right-to-left) to minimize bbox shift
-            def _sort_key(match):
-                tf = target_faces[match[1]]
-                return -float(tf.bbox[0]) if hasattr(tf, 'bbox') else 0
-            matches.sort(key=_sort_key)
-            
+            # Sort by target face x-position (right-to-left) to minimise bbox shift
+            matches.sort(key=lambda m: -float(target_faces[m[1]].bbox[0]) if hasattr(target_faces[m[1]], 'bbox') else 0)
+
             print("[ReActor V3] ── Swapping Matched Faces ──")
             swapped_target_faces = []  # Track which target faces were swapped
             for mi, (src_idx, tgt_idx, similarity) in enumerate(matches):
@@ -529,82 +544,119 @@ class ReActorV3:
                 target_face = target_faces[tgt_idx]
                 sg = self.get_gender(source_face)
                 tg = self.get_gender(target_face)
-                
+
                 print(f"[ReActor V3]   Swap {mi+1}/{len(matches)}: Source[{src_idx}]({sg}) → Target[{tgt_idx}]({tg}) [sim={similarity:.3f}]")
-                
+
                 if hasattr(target_face, 'bbox'):
                     bbox = [int(v) for v in target_face.bbox]
                     print(f"[ReActor V3]     Target face bbox: {bbox}")
                 if hasattr(source_face, 'embedding') and source_face.embedding is not None:
                     emb_norm = float(np.linalg.norm(source_face.embedding))
                     print(f"[ReActor V3]     Source embedding norm: {emb_norm:.2f}")
-                
+
                 t0 = time.time()
                 result = self.face_swapper.get(result, target_face, source_face, paste_back=True)
                 elapsed = time.time() - t0
                 print(f"[ReActor V3]     Swap completed in {elapsed:.3f}s")
-                
+
                 # Mouth preservation per face
                 if self.mouth_protect_enabled:
                     mouth_ratio, mouth_is_open = self._detect_mouth_open(target_face, original_for_occlusion)
                     if mouth_is_open:
                         print(f"[ReActor V3]     ⚠ Open mouth on Target[{tgt_idx}] (ratio={mouth_ratio:.3f}) — preserving")
                         result = self._preserve_mouth_region(original_for_occlusion, result, target_face, mouth_ratio)
-                
-                # Occlusion preservation per face
-                result = self._preserve_foreground_occlusions(
-                    original_for_occlusion, result, target_face, stage=f"auto-swap-{mi}"
-                )
+
                 swapped_target_faces.append(target_face)
             
-            # ── Restore with GPEN if specified ──
-            if restore_model and restore_model.lower() != 'none':
-                if self.load_restorer(restore_model):
-                    if self.current_restorer:
-                        # ── Steps 2–3: Conditional GPEN gate (auto-match) ──
-                        _gate_face = swapped_target_faces[0] if swapped_target_faces else None
-                        _run_gpen_batch = (not _gate_face) or self._should_run_gpen(result, _gate_face)
-                        if not _run_gpen_batch:
-                            print("[ReActor V3]   GPEN skipped — applying mild adaptive sharpen (auto-match)")
-                            _prim_src_face = all_source_faces[0] if all_source_faces else None
-                            if _gate_face:
-                                result = self._mild_adaptive_sharpen(result, _gate_face, source_img, _prim_src_face)
+            # ── Re-detect faces after swap for fresh bboxes ──
+            if self.redetect_after_swap and swapped_target_faces:
+                print("[ReActor V3] ── Re-detecting faces after swap (fresh bboxes) ──")
+                fresh_faces = self.get_faces(result)
+                if fresh_faces and len(fresh_faces) >= len(swapped_target_faces):
+                    # Match old swapped faces to new detections by bbox proximity
+                    fresh_matched = []
+                    used = set()
+                    for old_face in swapped_target_faces:
+                        if not hasattr(old_face, 'bbox') or old_face.bbox is None:
+                            fresh_matched.append(old_face)
+                            continue
+                        old_cx = (old_face.bbox[0] + old_face.bbox[2]) / 2
+                        old_cy = (old_face.bbox[1] + old_face.bbox[3]) / 2
+                        best_dist = float('inf')
+                        best_idx = -1
+                        for fi, ff in enumerate(fresh_faces):
+                            if fi in used:
+                                continue
+                            if not hasattr(ff, 'bbox') or ff.bbox is None:
+                                continue
+                            new_cx = (ff.bbox[0] + ff.bbox[2]) / 2
+                            new_cy = (ff.bbox[1] + ff.bbox[3]) / 2
+                            dist = ((old_cx - new_cx)**2 + (old_cy - new_cy)**2)**0.5
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_idx = fi
+                        if best_idx >= 0:
+                            used.add(best_idx)
+                            old_bbox = [int(v) for v in old_face.bbox]
+                            new_bbox = [int(v) for v in fresh_faces[best_idx].bbox]
+                            print(f"[ReActor V3]   Remapped face: old_bbox={old_bbox} → new_bbox={new_bbox} (dist={best_dist:.1f}px)")
+                            fresh_matched.append(fresh_faces[best_idx])
                         else:
-                            print(f"[ReActor V3] ── GPEN HF Enhancement with {restore_model} ──")
-                            t0 = time.time()
+                            fresh_matched.append(old_face)
+                    swapped_target_faces = fresh_matched
+                else:
+                    print(f"[ReActor V3]   Re-detection found {len(fresh_faces) if fresh_faces else 0} faces (expected >= {len(swapped_target_faces)}), keeping original bboxes")
+            
+            # ── Composite mode: selectively run GPEN and/or face-fix ──
+            run_gpen = self.composite_mode in ('full', 'swap_gpen')
+            run_face_fix = self.composite_mode in ('full', 'swap_fix')
 
-                            # Per-face HF delta injection.
-                            # GPEN output is NEVER blended directly —
-                            # only its additional high-frequency detail is injected.
-                            for mi_h, tf in enumerate(swapped_target_faces):
-                                if hasattr(tf, 'bbox') and tf.bbox is not None:
-                                    result = self.current_restorer.enhance_face_region(
-                                        result, tf.bbox
-                                    )
+            if self.composite_mode != 'full':
+                print(f"[ReActor V3]   Composite mode '{self.composite_mode}': GPEN={'ON' if run_gpen else 'OFF'}, FaceFix={'ON' if run_face_fix else 'OFF'}")
 
-                            elapsed = time.time() - t0
-                            print(f"[ReActor V3]   GPEN HF enhancement completed in {elapsed:.3f}s")
+            # ── Load restorer once before the per-face loop ──
+            restorer_ready = False
+            if run_gpen and restore_model and restore_model.lower() != 'none':
+                restorer_ready = self.load_restorer(restore_model) and (self.current_restorer is not None)
+            elif not run_gpen and restore_model and restore_model.lower() != 'none':
+                print(f"[ReActor V3]   GPEN skipped (composite_mode='{self.composite_mode}')")
 
-                        # Final occlusion preservation for each face
-                        for mi, tf in enumerate(swapped_target_faces):
-                            result = self._preserve_foreground_occlusions(
-                                original_for_occlusion, result, tf, stage=f"auto-restore-{mi}"
-                            )
-            # ── Adaptive Face Enhancement (replaces static face fix) ──
-            if self.auto_face_fix:
-                print("[ReActor V3] ── Adaptive Face Enhancement (Auto-Match) ──")
-                t0_fix = time.time()
-                # Use the first source face for identity anchor
-                primary_source_face = all_source_faces[0] if all_source_faces else None
-                result = auto_fix_face(
-                    reference_img=source_img,
-                    output_img=result,
-                    face_analyser=self.face_analyser,
-                    target_img=target_img,
-                    source_face=primary_source_face,
+            # ── Per-face: GPEN → face-fix → occlusion  (single pass, no duplicates) ──
+            print(f"[ReActor V3] ── Post-processing {len(swapped_target_faces)} swapped face(s) ──")
+            for mi, tf in enumerate(swapped_target_faces):
+                src_idx, _tgt_idx, _sim = matches[mi]
+                m_src_face = all_source_faces[src_idx]
+                m_src_img  = _face_to_src_img.get(id(m_src_face), source_img)
+
+                # GPEN HF delta injection — conditional gate evaluated per face
+                if restorer_ready and hasattr(tf, 'bbox') and tf.bbox is not None:
+                    if self._should_run_gpen(result, tf):
+                        print(f"[ReActor V3]   GPEN enhance face {mi+1}/{len(swapped_target_faces)}")
+                        t0 = time.time()
+                        result = self.current_restorer.enhance_face_region(result, tf.bbox)
+                        print(f"[ReActor V3]     GPEN done in {time.time()-t0:.3f}s")
+                    else:
+                        print(f"[ReActor V3]   GPEN skipped for face {mi+1} — mild adaptive sharpen")
+                        result = self._mild_adaptive_sharpen(result, tf, m_src_img, m_src_face)
+
+                # Adaptive face enhancement — targeted to this face only (no whole-image re-detection)
+                if run_face_fix and self.auto_face_fix:
+                    result = auto_fix_face(
+                        reference_img=m_src_img,
+                        output_img=result,
+                        face_analyser=self.face_analyser,
+                        target_img=target_img,
+                        source_face=m_src_face,
+                        target_face=tf,
+                    )
+
+                # Occlusion preservation — single call per face, after all processing
+                result = self._preserve_foreground_occlusions(
+                    original_for_occlusion, result, tf, stage=f"auto-final-{mi}"
                 )
-                fix_elapsed = time.time() - t0_fix
-                print(f"[ReActor V3]   Adaptive face enhancement completed in {fix_elapsed:.3f}s")
+
+            if not run_face_fix and self.auto_face_fix:
+                print(f"[ReActor V3]   Face fix skipped (composite_mode='{self.composite_mode}')")
 
             # ── Cleanup ──
             if self.auto_cleanup:
@@ -905,6 +957,22 @@ class ReActorV3:
         self.auto_face_fix = bool(enabled)
         print(f"[ReActor V3] Auto face fix set to: {self.auto_face_fix}")
 
+    def set_composite_mode(self, mode: str):
+        """Set composite pipeline mode: 'full', 'swap_gpen', 'swap_fix', 'swap_only'."""
+        valid = {'full', 'swap_gpen', 'swap_fix', 'swap_only'}
+        self.composite_mode = mode if mode in valid else 'full'
+        print(f"[ReActor V3] Composite mode set to: {self.composite_mode}")
+
+    def set_strict_no_fallback(self, strict: bool):
+        """If True, auto-match won't force a fallback swap when threshold fails."""
+        self.strict_no_fallback = bool(strict)
+        print(f"[ReActor V3] Strict no-fallback set to: {self.strict_no_fallback}")
+
+    def set_redetect_after_swap(self, enabled: bool):
+        """If True, re-detect faces after swap so GPEN/fix use fresh bboxes."""
+        self.redetect_after_swap = bool(enabled)
+        print(f"[ReActor V3] Re-detect after swap set to: {self.redetect_after_swap}")
+
     def set_cleanup_mode(self, aggressive: bool):
         """Set whether cleanup should be aggressive (unload all models)"""
         self.aggressive_cleanup = aggressive
@@ -1198,7 +1266,7 @@ class ReActorV3:
     # Conditional GPEN gate helpers  (streak-artifact fix)
     # ─────────────────────────────────────────────────────────────────────
 
-    RESTORE_THRESHOLD = 120  # Laplacian variance below this → face is soft → OK to restore
+    RESTORE_THRESHOLD = 180  # Laplacian variance below this → face is soft → OK to restore
 
     def _face_lap_var(self, img: np.ndarray, face) -> float:
         """Laplacian variance of the face bbox region in *img*."""
@@ -1227,8 +1295,8 @@ class ReActorV3:
             face_size = max(abs(float(x2) - float(x1)), abs(float(y2) - float(y1)))
 
         # Step 3: Resolution guard
-        if face_size > 300:
-            print(f"[ReActor V3] GPEN skip: face_size={face_size:.0f}px > 300 — large face, no restore")
+        if face_size > 450:
+            print(f"[ReActor V3] GPEN skip: face_size={face_size:.0f}px > 450 — large face, no restore")
             return False
 
         # Step 2: Sharpness guard
@@ -1467,8 +1535,40 @@ class ReActorV3:
             
             result = self._preserve_foreground_occlusions(target_img, result, target_face, stage="post-swap")
             
+            # ── Re-detect face after swap for fresh bbox ──
+            if self.redetect_after_swap and hasattr(target_face, 'bbox'):
+                print("[ReActor V3] ── Re-detecting face after swap (fresh bbox) ──")
+                fresh_faces = self.get_faces(result)
+                if fresh_faces:
+                    old_cx = (target_face.bbox[0] + target_face.bbox[2]) / 2
+                    old_cy = (target_face.bbox[1] + target_face.bbox[3]) / 2
+                    best_dist = float('inf')
+                    best_face = None
+                    for ff in fresh_faces:
+                        if not hasattr(ff, 'bbox') or ff.bbox is None:
+                            continue
+                        new_cx = (ff.bbox[0] + ff.bbox[2]) / 2
+                        new_cy = (ff.bbox[1] + ff.bbox[3]) / 2
+                        dist = ((old_cx - new_cx)**2 + (old_cy - new_cy)**2)**0.5
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_face = ff
+                    if best_face is not None:
+                        old_bbox = [int(v) for v in target_face.bbox]
+                        new_bbox = [int(v) for v in best_face.bbox]
+                        print(f"[ReActor V3]   Remapped: old_bbox={old_bbox} → new_bbox={new_bbox} (dist={best_dist:.1f}px)")
+                        target_face = best_face
+                    else:
+                        print("[ReActor V3]   No matching face found in re-detect, keeping original bbox")
+                else:
+                    print("[ReActor V3]   Re-detection found 0 faces, keeping original bbox")
+            
+            # ── Composite mode control ──
+            run_gpen = self.composite_mode in ('full', 'swap_gpen')
+            run_face_fix = self.composite_mode in ('full', 'swap_fix')
+            
             # Restore using GPEN if specified
-            if restore_model:
+            if run_gpen and restore_model:
                 if not self.load_restorer(restore_model):
                     return result, "Swapped (restoration failed to load)"
                 
@@ -1482,12 +1582,13 @@ class ReActorV3:
                     if not self._should_run_gpen(result, target_face):
                         print("[ReActor V3]   GPEN skipped — applying mild adaptive sharpen instead")
                         result = self._mild_adaptive_sharpen(result, target_face, source_img, source_face)
-                        if self.auto_face_fix:
+                        if run_face_fix and self.auto_face_fix:
                             print("[ReActor V3] ── Adaptive Face Enhancement ──")
                             result = auto_fix_face(
                                 reference_img=source_img, output_img=result,
                                 face_analyser=self.face_analyser,
                                 target_img=target_img, source_face=source_face,
+                                target_face=target_face,
                             )
                         if self.auto_cleanup:
                             self.cleanup_memory(aggressive=self.aggressive_cleanup)
@@ -1512,7 +1613,7 @@ class ReActorV3:
                     )
                     
                     # ── Adaptive Face Enhancement (replaces static face fix) ──
-                    if self.auto_face_fix:
+                    if run_face_fix and self.auto_face_fix:
                         print("[ReActor V3] ── Adaptive Face Enhancement ──")
                         t0_fix = time.time()
                         restored_result = auto_fix_face(
@@ -1521,6 +1622,7 @@ class ReActorV3:
                             face_analyser=self.face_analyser,
                             target_img=target_img,
                             source_face=source_face,
+                            target_face=target_face,
                         )
                         fix_elapsed = time.time() - t0_fix
                         print(f"[ReActor V3]   Adaptive face enhancement completed in {fix_elapsed:.3f}s")
@@ -1555,6 +1657,21 @@ class ReActorV3:
                         self.cleanup_memory(aggressive=self.aggressive_cleanup)
                     return restored_result, f"Swapped and restored with {restore_model}"
             
+            # ── Face-fix without GPEN (when no restore model or GPEN skipped by composite mode) ──
+            if run_face_fix and self.auto_face_fix:
+                print("[ReActor V3] ── Adaptive Face Enhancement (no GPEN) ──")
+                t0_fix = time.time()
+                result = auto_fix_face(
+                    reference_img=source_img,
+                    output_img=result,
+                    face_analyser=self.face_analyser,
+                    target_img=target_img,
+                    source_face=source_face,
+                    target_face=target_face,
+                )
+                fix_elapsed = time.time() - t0_fix
+                print(f"[ReActor V3]   Adaptive face enhancement completed in {fix_elapsed:.3f}s")
+
             # Automatic VRAM cleanup after processing
             if self.auto_cleanup:
                 self.cleanup_memory(aggressive=self.aggressive_cleanup)

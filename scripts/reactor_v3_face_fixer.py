@@ -38,19 +38,30 @@ import cv2
 import numpy as np
 
 
+def _cosine_similarity(a, b):
+    """Cosine similarity between two embedding vectors."""
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a < 1e-9 or norm_b < 1e-9:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 0.  ADAPTIVE CONFIG — no hardcoded single value anywhere
 # ──────────────────────────────────────────────────────────────────────────────
 
 ADAPTIVE_CONFIG = {
     "identity_weight": 0.6,
-    "max_sharpen": 0.35,
-    "max_texture_blend": 0.4,
+    "max_sharpen": 0.50,
+    "max_texture_blend": 0.55,
     "low_lum_threshold": 45,
     "restore_min": 0.2,
     "restore_max": 0.8,
     "similarity_scale": 8.0,
-    "chroma_align_strength": 0.2,
+    "chroma_align_strength": 0.08,  # tiny nudge only — 0.45 was shifting skin tone to target person's
     "small_face_px": 300,
     "confidence_threshold": 0.4,
 }
@@ -250,9 +261,9 @@ def classify_face_type(metrics: FaceDetailMetrics) -> FaceTypeInfo:
     else:
         info = FaceTypeInfo(
             face_type="normal",
-            max_sharpen=0.25,
-            max_restore=0.6,
-            max_texture=0.3,
+            max_sharpen=0.40,
+            max_restore=0.7,
+            max_texture=0.40,
         )
 
     print(f"[FaceFixer] Face-type classified: {info}")
@@ -353,16 +364,25 @@ def apply_lab_histogram_adaptation(
     if int(np.sum(mask_bool)) < 50:
         return swapped_crop
 
-    # ── L channel: histogram match (luminance transfer) ──
+    # ── L channel: conservative mean brightness alignment only ──────────
+    # Full histogram match was identity-destructive: it completely remapped
+    # shadow patterns (a strong identity cue), making the face read as a
+    # different person. Instead shift only the mean brightness, capped at
+    # ±12 LAB units so dramatic lighting differences can't flip identity.
     L_swap_masked = lab_swap[:, :, 0][mask_bool]
     L_tgt_masked  = lab_tgt[:, :, 0][mask_bool]
-    L_matched     = _histogram_match_channel(L_swap_masked, L_tgt_masked)
+    L_delta = float(np.mean(L_tgt_masked)) - float(np.mean(L_swap_masked))
+    L_delta = float(np.clip(L_delta, -12.0, 12.0))  # hard cap
 
     lab_result = lab_swap.copy()
-    lab_result[:, :, 0][mask_bool] = L_matched
+    lab_result[:, :, 0][mask_bool] = np.clip(
+        lab_swap[:, :, 0][mask_bool] + L_delta, 0.0, 255.0
+    )
 
-    # ── A/B channels: light mean alignment only ──
-    chroma_str = ADAPTIVE_CONFIG["chroma_align_strength"]  # 0.2
+    # ── A/B channels: minimal nudge (0.08) ─────────────────────────────
+    # 0.45 was shifting skin colour 45% toward the target person's tone,
+    # producing an in-between face that looked like neither source nor target.
+    chroma_str = ADAPTIVE_CONFIG["chroma_align_strength"]  # 0.08
     for ch in [1, 2]:
         swap_mean = float(np.mean(lab_swap[:, :, ch][mask_bool]))
         tgt_mean  = float(np.mean(lab_tgt[:, :, ch][mask_bool]))
@@ -415,11 +435,10 @@ def compute_identity_restore_weight(
         restore_weight *= 0.5
         print(f"[FaceFixer] Identity drift detected (delta={delta_sim:.3f} < -0.02) — halving restore weight")
 
-    # Hard cap at 0.45 to prevent over-restoration
     restore_weight = float(np.clip(
         restore_weight,
         ADAPTIVE_CONFIG["restore_min"],
-        min(ADAPTIVE_CONFIG["restore_max"], 0.45),
+        ADAPTIVE_CONFIG["restore_max"],
     ))
 
     print(
@@ -434,12 +453,17 @@ def compute_identity_restore_weight(
 # 5C.  Adaptive Sharpening   (Section C — replaces static unsharp mask)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_hf_energy(face_crop: np.ndarray) -> float:
-    """High-frequency energy (Laplacian bandpass)."""
+def compute_hf_energy(face_crop: np.ndarray, sigma: float = 2.8) -> float:
+    """Perceptual mid-frequency energy (bandpass at ~2-5px scale).
+
+    sigma=2.8 targets the clarity band that makes faces look sharp vs.
+    AI-blurry. The old sigma=1.5 measured sub-pixel noise instead, causing
+    hf_ratio≈1.0 for blurry inswapper outputs and gain≈0 (no sharpening).
+    """
     if face_crop is None or face_crop.size == 0:
         return 0.0
     gray = _to_gray(face_crop).astype(np.float32)
-    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.5)
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
     hf = gray - blurred
     return float(np.mean(hf ** 2))
 
@@ -477,7 +501,9 @@ def apply_adaptive_sharpening(
         return swapped_crop
 
     # Proportional gain capped by face-type limit
-    gain = float(np.clip((1.0 - hf_ratio) * 1.2, 0.0, face_type.max_sharpen))
+    # Multiplier raised to 2.2 so a face at 50% sharpness of reference gets
+    # a meaningful gain (1.1) before the face_type cap is applied.
+    gain = float(np.clip((1.0 - hf_ratio) * 2.2, 0.0, face_type.max_sharpen))
 
     # Lighting-aware scaling  (Section E)
     if lum_variance < ADAPTIVE_CONFIG["low_lum_threshold"]:
@@ -486,9 +512,9 @@ def apply_adaptive_sharpening(
     if gain < 0.01:
         return swapped_crop
 
-    # Edge-aware unsharp mask
+    # Edge-aware unsharp mask — sigma=2.0 targets the perceptual clarity band
     swap_f  = swapped_crop.astype(np.float32)
-    blurred = cv2.GaussianBlur(swap_f, (0, 0), sigmaX=1.0)
+    blurred = cv2.GaussianBlur(swap_f, (0, 0), sigmaX=2.0)
     detail  = swap_f - blurred
 
     gray  = _to_gray(swapped_crop)
@@ -541,7 +567,7 @@ def apply_texture_injection(
     if hf_ratio >= 1.0:
         return swapped_crop
 
-    blend_strength = float(np.clip((1.0 - hf_ratio) * 0.6, 0.0, face_type.max_texture))
+    blend_strength = float(np.clip((1.0 - hf_ratio) * 0.8, 0.0, face_type.max_texture))
 
     # Lighting-aware scaling (Section E)
     if lum_variance < ADAPTIVE_CONFIG["low_lum_threshold"]:
@@ -673,7 +699,7 @@ class FaceDetailFixer:
         face_analyser=None,
         ref_face=None,
         out_face=None,
-        fix_all_faces: bool = True,
+        fix_all_faces: bool = False,
         target_img: np.ndarray = None,
         source_face=None,
     ) -> np.ndarray:
@@ -705,12 +731,26 @@ class FaceDetailFixer:
         if ref_face is None and face_analyser is not None:
             ref_faces = face_analyser.get(reference_img)
             if ref_faces:
-                ref_face = max(
-                    ref_faces,
-                    key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
-                    if hasattr(f, 'bbox') else 0
-                )
-                print(f"[FaceFixer] Reference face detected: bbox={[int(v) for v in ref_face.bbox]}")
+                # Prefer the face closest by embedding to source_face if available
+                if source_face is not None and hasattr(source_face, 'embedding') and source_face.embedding is not None:
+                    best_sim = -1.0
+                    for rf in ref_faces:
+                        if hasattr(rf, 'embedding') and rf.embedding is not None:
+                            sim = _cosine_similarity(source_face.embedding, rf.embedding)
+                            if sim > best_sim:
+                                best_sim = sim
+                                ref_face = rf
+                    if ref_face is None:
+                        ref_face = ref_faces[0]
+                    print(f"[FaceFixer] Reference face matched by embedding (sim={best_sim:.3f}): bbox={[int(v) for v in ref_face.bbox]}")
+                else:
+                    # Fallback: largest face
+                    ref_face = max(
+                        ref_faces,
+                        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                        if hasattr(f, 'bbox') else 0
+                    )
+                    print(f"[FaceFixer] Reference face detected (largest): bbox={[int(v) for v in ref_face.bbox]}")
             else:
                 print("[FaceFixer] WARNING: No face in reference image — skipping")
                 return output_img
@@ -740,23 +780,11 @@ class FaceDetailFixer:
         elif ref_face is not None and hasattr(ref_face, 'embedding'):
             source_emb = ref_face.embedding
 
-        # ── Target crop (lighting anchor) ─────────────────────────────────
-        target_crop = None
-        if target_img is not None:
-            # Try to detect the corresponding face in the target
-            if face_analyser is not None:
-                tgt_faces = face_analyser.get(target_img)
-                if tgt_faces:
-                    tgt_face = max(
-                        tgt_faces,
-                        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
-                        if hasattr(f, 'bbox') else 0
-                    )
-                    tgt_bbox = _face_bbox_expanded(tgt_face, target_img.shape, expand_ratio=0.15)
-                    target_crop = _safe_crop(target_img, *tgt_bbox)
-            if target_crop is None:
-                # Fallback: cannot get target crop without face detection
-                target_crop = None
+        # ── Target faces (lighting anchor) ───────────────────────────────
+        # Pre-detect all target faces so we can match per-output-face below
+        _tgt_faces_cache = []
+        if target_img is not None and face_analyser is not None:
+            _tgt_faces_cache = face_analyser.get(target_img) or []
 
         # ── Fix each output face ──────────────────────────────────────────
         result = output_img.copy()
@@ -775,6 +803,28 @@ class FaceDetailFixer:
             out_metrics = self.analyzer.analyze(out_crop)
             print(f"[FaceFixer] Output face {i} metrics: {out_metrics}")
 
+            # ── Per-face target crop (lighting anchor) ───────────────────
+            # Match this output face to the closest target face by bbox center
+            target_crop = None
+            if _tgt_faces_cache:
+                o_cx = (oface.bbox[0] + oface.bbox[2]) / 2
+                o_cy = (oface.bbox[1] + oface.bbox[3]) / 2
+                best_dist = float('inf')
+                best_tgt = None
+                for tf in _tgt_faces_cache:
+                    if not hasattr(tf, 'bbox'):
+                        continue
+                    t_cx = (tf.bbox[0] + tf.bbox[2]) / 2
+                    t_cy = (tf.bbox[1] + tf.bbox[3]) / 2
+                    dist = (o_cx - t_cx) ** 2 + (o_cy - t_cy) ** 2
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_tgt = tf
+                if best_tgt is not None:
+                    tgt_bbox = _face_bbox_expanded(best_tgt, target_img.shape, expand_ratio=0.15)
+                    target_crop = _safe_crop(target_img, *tgt_bbox)
+                    print(f"[FaceFixer] Target lighting anchor for face {i}: bbox={[int(v) for v in best_tgt.bbox]}, dist={best_dist:.0f}")
+
             # ── 1. Face-type classification  (H) ─────────────────────────
             face_type = classify_face_type(ref_metrics)
 
@@ -792,10 +842,10 @@ class FaceDetailFixer:
                 out_crop, ref_crop, face_type, out_metrics.luminance_variance,
             )
 
-            # ── 5. Controlled texture injection  (D + E) ────────────────
-            out_crop = apply_texture_injection(
-                out_crop, ref_crop, skin_mask, face_type, out_metrics.luminance_variance,
-            )
+            # ── 5. Texture injection disabled ─────────────────────────
+            # Injecting source-face HF texture onto the swapped face directly
+            # causes ghosted/double-face artifacts (reference skin pattern bleeds
+            # through). GPEN's HF delta already handles detail recovery.
 
             # ── 6. Confidence-based blending  (G) ────────────────────────
             if source_emb is not None and face_analyser is not None:
@@ -903,6 +953,7 @@ def auto_fix_face(
     out_face=None,
     target_img: np.ndarray = None,
     source_face=None,
+    target_face=None,
 ) -> np.ndarray:
     """
     One-call adaptive face enhancement.
@@ -915,6 +966,9 @@ def auto_fix_face(
         out_face      : Pre-detected output face (optional).
         target_img    : Original target image — lighting anchor (BGR uint8).
         source_face   : Source face with .embedding (for confidence blend).
+        target_face   : The specific swapped face to enhance — skips full-image
+                        re-detection and processes only this face. Pass the face
+                        object returned by InsightFace after swap.
 
     Returns:
         Adaptively enhanced output image (BGR uint8).
@@ -925,7 +979,7 @@ def auto_fix_face(
         output_img=output_img,
         face_analyser=face_analyser,
         ref_face=ref_face,
-        out_face=out_face,
+        out_face=out_face if out_face is not None else target_face,
         target_img=target_img,
         source_face=source_face,
     )
