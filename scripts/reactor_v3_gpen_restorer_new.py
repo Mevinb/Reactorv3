@@ -314,6 +314,10 @@ class GPENFaceRestorer:
 
         # ── Step 6: Compute HF delta (GPEN's added micro-detail only) ───
         hf_delta = hf_gpen - hf_swapped
+        # Retain only the positive (detail-adding) delta.
+        # GPEN's StyleGAN prior sometimes smooths skin → negative delta.
+        # Injecting that would deepen the plasticky/over-smooth look.
+        hf_delta = np.maximum(hf_delta, 0.0)
 
         # ── Step 6b: Spatial normalization of HF delta ──────────────────
         # Prevents center over-sharpening and cheek under-sharpening.
@@ -338,6 +342,19 @@ class GPENFaceRestorer:
             f"ratio={ratio:.3f} → alpha={alpha:.3f}"
         )
 
+        # ── Nose protection: attenuate HF injection at the nose region ───────
+        # GPEN's StyleGAN prior normalises nose shape; injecting its full HF
+        # delta at the nose tip overrides the swapped nose and distorts it
+        # toward a generic shape. Attenuate by ~85 % at the tip, fading
+        # smoothly to 0 % attenuation at the eye / chin regions.
+        _nx, _ny, _nrx, _nry = 256, 282, 77, 62  # tip centre (~55 % down) & radii on 512-grid
+        _yy, _xx = np.ogrid[:512, :512]
+        _nose_dist    = ((_xx - _nx) / _nrx) ** 2 + ((_yy - _ny) / _nry) ** 2
+        _nose_protect = np.clip(_nose_dist, 0.15, 1.0).astype(np.float32)  # 0.15 at tip → 1.0 outside ellipse
+        if hf_balanced.ndim == 3:
+            _nose_protect = _nose_protect[:, :, None]
+        hf_balanced = hf_balanced * _nose_protect
+
         enhanced_lin = face_lin + alpha * hf_balanced
 
         # ── Convert linear → sRGB ────────────────────────────────────────
@@ -351,7 +368,7 @@ class GPENFaceRestorer:
         _g1 = cv2.GaussianBlur(enhanced_512, (0, 0), 1.2)   # fine-low
         _g2 = cv2.GaussianBlur(enhanced_512, (0, 0), 3.0)   # coarse-low
         _mid = _g1 - _g2                                     # clarity band
-        enhanced_512 = np.clip(enhanced_512 + _mid * 0.30, 0.0, 1.0)
+        enhanced_512 = np.clip(enhanced_512 + _mid * 0.45, 0.0, 1.0)  # raised 0.30→0.45: recover more 128px inswapper softness
 
         # ── Step 9: Downscale back to original bbox size ─────────────────
         enhanced_face = cv2.resize(enhanced_512, (bbox_w, bbox_h),
@@ -363,11 +380,12 @@ class GPENFaceRestorer:
 
         mask   = np.zeros((bbox_h, bbox_w), dtype=np.float32)
         cx, cy = bbox_w // 2, bbox_h // 2
-        ax     = max(2, int(bbox_w * 0.45))
-        ay     = max(2, int(bbox_h * 0.45))
+        ax     = max(2, int(bbox_w * 0.48))  # widened 0.45→0.48 to match _paste_back boundary
+        ay     = max(2, int(bbox_h * 0.48))
         cv2.ellipse(mask, (cx, cy), (ax, ay), 0, 0, 360, 1.0, -1)
-        # Scale feather to 15% of bbox for smoother compositing.
-        feather = max(7, int(min(bbox_w, bbox_h) * 0.15))
+        # Scale feather to 18% of bbox — matches _paste_back's feather so double-composite
+        # edges align and the face-neck seam halo is eliminated.
+        feather = max(7, int(min(bbox_w, bbox_h) * 0.18))
         if feather % 2 == 0:
             feather += 1
         mask = cv2.GaussianBlur(mask, (feather, feather), feather * 0.35)

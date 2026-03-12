@@ -61,7 +61,7 @@ ADAPTIVE_CONFIG = {
     "restore_min": 0.2,
     "restore_max": 0.8,
     "similarity_scale": 8.0,
-    "chroma_align_strength": 0.08,  # tiny nudge only — 0.45 was shifting skin tone to target person's
+    "chroma_align_strength": 0.18,  # raised 0.08→0.18: 0.08 was too weak for scene-lighting variation in SDXL outputs
     "small_face_px": 300,
     "confidence_threshold": 0.4,
 }
@@ -160,6 +160,23 @@ class FaceDetailAnalyzer:
     GABOR_SIGMA   = 3.0
     GABOR_GAMMA   = 0.5
     GABOR_KSIZE   = (15, 15)
+    
+    # Pre-computed Gabor kernels cache (class-level, shared across instances)
+    _gabor_kernels_cache = None
+    
+    @classmethod
+    def _get_gabor_kernels(cls):
+        """Lazy-initialize and return cached Gabor kernels to avoid recomputing on every analyze() call."""
+        if cls._gabor_kernels_cache is None:
+            cls._gabor_kernels_cache = []
+            for theta in cls.GABOR_THETAS:
+                for lambd in cls.GABOR_LAMBDAS:
+                    kernel = cv2.getGaborKernel(
+                        cls.GABOR_KSIZE, cls.GABOR_SIGMA, theta,
+                        lambd, cls.GABOR_GAMMA, psi=0, ktype=cv2.CV_32F
+                    )
+                    cls._gabor_kernels_cache.append(kernel)
+        return cls._gabor_kernels_cache
 
     def analyze(self, face_crop: np.ndarray) -> FaceDetailMetrics:
         if face_crop is None or face_crop.size == 0:
@@ -184,22 +201,18 @@ class FaceDetailAnalyzer:
         # Luminance variance (for lighting-aware scaling)
         m.luminance_variance = float(np.var(gray))
 
-        # Gabor skin texture energy (L channel)
+        # Gabor skin texture energy (L channel) — using pre-cached kernels
         if face_crop.ndim == 3:
             lab = cv2.cvtColor(face_crop, cv2.COLOR_BGR2LAB)
             L = lab[:, :, 0].astype(np.float32)
         else:
             L = gray
 
+        gabor_kernels = self._get_gabor_kernels()
         gabor_responses = []
-        for theta in self.GABOR_THETAS:
-            for lambd in self.GABOR_LAMBDAS:
-                kernel = cv2.getGaborKernel(
-                    self.GABOR_KSIZE, self.GABOR_SIGMA, theta,
-                    lambd, self.GABOR_GAMMA, psi=0, ktype=cv2.CV_32F
-                )
-                resp = cv2.filter2D(L, cv2.CV_32F, kernel)
-                gabor_responses.append(float(np.mean(np.abs(resp))))
+        for kernel in gabor_kernels:
+            resp = cv2.filter2D(L, cv2.CV_32F, kernel)
+            gabor_responses.append(float(np.mean(np.abs(resp))))
         m.skin_texture = float(np.mean(gabor_responses))
 
         # High-frequency energy ratio
@@ -247,7 +260,7 @@ def classify_face_type(metrics: FaceDetailMetrics) -> FaceTypeInfo:
     if sharp > 3000 and hf > 0.005:
         info = FaceTypeInfo(
             face_type="high_quality",
-            max_sharpen=0.15,                                     # cap: already sharp
+            max_sharpen=0.25,                                     # raised 0.15→0.25: SDXL sources are sharp but still need clarity after inswapper
             max_restore=0.4,                                      # cap: prevent bone distortion
             max_texture=0.2,
         )
@@ -372,7 +385,7 @@ def apply_lab_histogram_adaptation(
     L_swap_masked = lab_swap[:, :, 0][mask_bool]
     L_tgt_masked  = lab_tgt[:, :, 0][mask_bool]
     L_delta = float(np.mean(L_tgt_masked)) - float(np.mean(L_swap_masked))
-    L_delta = float(np.clip(L_delta, -12.0, 12.0))  # hard cap
+    L_delta = float(np.clip(L_delta, -18.0, 18.0))  # widened cap: ±12 was too tight for dramatic scene lighting
 
     lab_result = lab_swap.copy()
     lab_result[:, :, 0][mask_bool] = np.clip(
@@ -501,9 +514,9 @@ def apply_adaptive_sharpening(
         return swapped_crop
 
     # Proportional gain capped by face-type limit
-    # Multiplier raised to 2.2 so a face at 50% sharpness of reference gets
-    # a meaningful gain (1.1) before the face_type cap is applied.
-    gain = float(np.clip((1.0 - hf_ratio) * 2.2, 0.0, face_type.max_sharpen))
+    # Multiplier 1.8: lower than 2.2 to prevent over-sharpening on blurry
+    # inswapper output while still giving a meaningful gain (0.9×) at 50 % deficit.
+    gain = float(np.clip((1.0 - hf_ratio) * 1.8, 0.0, face_type.max_sharpen))
 
     # Lighting-aware scaling  (Section E)
     if lum_variance < ADAPTIVE_CONFIG["low_lum_threshold"]:
@@ -702,6 +715,7 @@ class FaceDetailFixer:
         fix_all_faces: bool = False,
         target_img: np.ndarray = None,
         source_face=None,
+        target_face=None,
     ) -> np.ndarray:
         """
         Full adaptive face enhancement pipeline.
@@ -781,10 +795,14 @@ class FaceDetailFixer:
             source_emb = ref_face.embedding
 
         # ── Target faces (lighting anchor) ───────────────────────────────
-        # Pre-detect all target faces so we can match per-output-face below
+        # Use cached target_face if provided to avoid redundant detection
         _tgt_faces_cache = []
-        if target_img is not None and face_analyser is not None:
+        if target_face is not None and hasattr(target_face, 'bbox'):
+            _tgt_faces_cache = [target_face]
+            print("[FaceFixer] Using pre-detected target face (cached) — no re-detection")
+        elif target_img is not None and face_analyser is not None:
             _tgt_faces_cache = face_analyser.get(target_img) or []
+            print(f"[FaceFixer] Detected {len(_tgt_faces_cache)} target face(s) for lighting anchor")
 
         # ── Fix each output face ──────────────────────────────────────────
         result = output_img.copy()
@@ -891,7 +909,7 @@ class FaceDetailFixer:
         # Elliptical base mask
         mask = np.zeros((expected_h, expected_w), dtype=np.float32)
         center = (expected_w // 2, expected_h // 2)
-        axes = (max(2, int(expected_w * 0.45)), max(2, int(expected_h * 0.45)))
+        axes = (max(2, int(expected_w * 0.48)), max(2, int(expected_h * 0.48)))  # widened 0.45→0.48 to match GPEN composite boundary
         cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
 
         # Feather
@@ -982,4 +1000,5 @@ def auto_fix_face(
         out_face=out_face if out_face is not None else target_face,
         target_img=target_img,
         source_face=source_face,
+        target_face=target_face,
     )

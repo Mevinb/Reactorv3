@@ -14,6 +14,7 @@ from typing import Optional, List, Tuple
 from PIL import Image
 import torch
 import gc
+import threading
 
 # Setup cuDNN path for ONNX Runtime CUDA provider
 def setup_cudnn_path():
@@ -116,6 +117,9 @@ class ReActorV3:
         self.composite_mode = 'full'       # 'full', 'swap_gpen', 'swap_fix', 'swap_only'
         self.strict_no_fallback = False     # If True, no swap when threshold fails
         self.redetect_after_swap = True     # Re-detect faces after swap for fresh bboxes
+        
+        # Performance optimization caches
+        self._occlusion_mask_cache = {}     # Cache computed occlusion masks by image hash to avoid recomputation
         
         print(f"[ReActor V3] InsightFace path: {self.insightface_path}")
         print(f"[ReActor V3] GPEN models path: {self.facerestore_path}")
@@ -287,6 +291,13 @@ class ReActorV3:
         emb1 = face1.embedding
         emb2 = face2.embedding
         if emb1 is None or emb2 is None:
+            return 0.0
+        
+        # Validate embedding dimensions to prevent corruption crashes
+        if not isinstance(emb1, np.ndarray) or not isinstance(emb2, np.ndarray):
+            return 0.0
+        if emb1.shape != (512,) or emb2.shape != (512,):
+            print(f"[ReActor V3] Warning: Invalid embedding shape - emb1: {emb1.shape}, emb2: {emb2.shape}")
             return 0.0
         norm1 = np.linalg.norm(emb1)
         norm2 = np.linalg.norm(emb2)
@@ -484,8 +495,11 @@ class ReActorV3:
             
             # ── Apply gender filter if M/F ──
             if gender_match in ['M', 'F']:
+                src_before = len(all_source_faces)
+                tgt_before = len(target_faces)
                 all_source_faces = self.filter_faces_by_gender(all_source_faces, gender_match)
                 target_faces = self.filter_faces_by_gender(target_faces, gender_match)
+                print(f"[ReActor V3]   Gender filter ({gender_match}): Source {src_before} → {len(all_source_faces)} faces, Target {tgt_before} → {len(target_faces)} faces")
                 if not all_source_faces:
                     gender_name = "male" if gender_match == 'M' else "female"
                     return target_img, f"Error: No {gender_name} faces in source"
@@ -645,6 +659,7 @@ class ReActorV3:
                         reference_img=m_src_img,
                         output_img=result,
                         face_analyser=self.face_analyser,
+                        ref_face=m_src_face,  # Pass pre-detected source face to avoid re-detection
                         target_img=target_img,
                         source_face=m_src_face,
                         target_face=tf,
@@ -654,13 +669,13 @@ class ReActorV3:
                 result = self._preserve_foreground_occlusions(
                     original_for_occlusion, result, tf, stage=f"auto-final-{mi}"
                 )
+                
+                # Incremental garbage collection between faces to reduce peak memory
+                if mi < len(swapped_target_faces) - 1:  # Don't GC after last face
+                    gc.collect()
 
             if not run_face_fix and self.auto_face_fix:
                 print(f"[ReActor V3]   Face fix skipped (composite_mode='{self.composite_mode}')")
-
-            # ── Cleanup ──
-            if self.auto_cleanup:
-                self.cleanup_memory(aggressive=self.aggressive_cleanup)
             
             pipeline_elapsed = time.time() - pipeline_start
             status = f"Auto-matched and swapped {len(matches)} face(s) in {pipeline_elapsed:.2f}s"
@@ -673,9 +688,12 @@ class ReActorV3:
             print(f"[ReActor V3] ✗ Auto-match ERROR: {e}")
             import traceback
             traceback.print_exc()
+            return target_img, f"Error: {str(e)}"
+        
+        finally:
+            # Always cleanup memory, even on errors
             if self.auto_cleanup:
                 self.cleanup_memory(aggressive=self.aggressive_cleanup)
-            return target_img, f"Error: {str(e)}"
 
     # ── End Auto Face Match Methods ──────────────────────────────────────────
 
@@ -716,8 +734,17 @@ class ReActorV3:
 
         # ── Try detailed landmarks first (68-pt / 106-pt / 478-pt) ────────
         landmark_2d = getattr(face, 'landmark_2d_106', None)
+        
+        # Validate landmark bounds to prevent IndexError
+        if landmark_2d is not None and (not isinstance(landmark_2d, np.ndarray) or landmark_2d.shape[0] < 106):
+            print(f"[ReActor V3] Warning: Invalid landmark_2d_106 shape: {landmark_2d.shape if isinstance(landmark_2d, np.ndarray) else 'not ndarray'}")
+            landmark_2d = None
+        
         if landmark_2d is None:
             landmark_2d = getattr(face, 'landmark_3d_68', None)
+            if landmark_2d is not None and (not isinstance(landmark_2d, np.ndarray) or landmark_2d.shape[0] < 68):
+                print(f"[ReActor V3] Warning: Invalid landmark_3d_68 shape: {landmark_2d.shape if isinstance(landmark_2d, np.ndarray) else 'not ndarray'}")
+                landmark_2d = None
         if landmark_2d is None:
             landmark_2d = getattr(face, 'landmark_2d_68', None)
 
@@ -1072,6 +1099,17 @@ class ReActorV3:
         mask = np.clip(mask, 0.0, 1.0)
 
         return mask, (x1, y1, x2, y2)
+    
+    def _compute_image_hash(self, img: np.ndarray) -> int:
+        """Compute a fast hash of an image for caching purposes (samples first 1KB of data)."""
+        if img is None or img.size == 0:
+            return 0
+        # Sample a subset of pixels for fast hashing
+        h, w = img.shape[:2]
+        stride_h = max(1, h // 16)
+        stride_w = max(1, w // 16)
+        sample = img[::stride_h, ::stride_w].tobytes()[:1024]
+        return hash(sample)
 
     def _build_adaptive_occlusion_mask(
         self,
@@ -1082,6 +1120,8 @@ class ReActorV3:
         """
         Build an adaptive mask for foreground objects that should stay in front of the face.
         Uses lost-edge + strong-change heuristics and keeps components that enter from face boundary.
+        
+        Implements caching to avoid recomputing for the same image pair across multiple faces.
         """
         if original_img is None or processed_img is None or face_mask is None:
             return np.zeros((0, 0), dtype=np.float32)
@@ -1097,6 +1137,13 @@ class ReActorV3:
         strength = float(np.clip(self.occlusion_strength, 0.0, 1.0))
         if strength <= 0.0:
             return np.zeros((h, w), dtype=np.float32)
+
+        # Check cache first to avoid redundant computation across multiple faces
+        cache_key = (self._compute_image_hash(original_img), self._compute_image_hash(processed_img), 
+                     sensitivity, strength)
+        if cache_key in self._occlusion_mask_cache:
+            print("[ReActor V3]   Occlusion mask: cache hit (reusing precomputed mask)")
+            return self._occlusion_mask_cache[cache_key].copy()  # Return copy to prevent cache corruption
 
         roi_mask = (face_mask > 0.10)
         if not np.any(roi_mask):
@@ -1171,7 +1218,17 @@ class ReActorV3:
         occ_mask = np.clip(occ_mask, 0.0, 1.0)
         occ_mask = np.minimum(occ_mask, np.clip(face_mask * 1.15, 0.0, 1.0))
         occ_mask *= strength
-        return occ_mask.astype(np.float32)
+        occ_mask_final = occ_mask.astype(np.float32)
+        
+        # Store in cache for reuse across multiple faces on same image
+        self._occlusion_mask_cache[cache_key] = occ_mask_final
+        # Limit cache size to prevent memory growth (keep last 10 entries)
+        if len(self._occlusion_mask_cache) > 10:
+            # Remove oldest entry (first key)
+            oldest_key = next(iter(self._occlusion_mask_cache))
+            del self._occlusion_mask_cache[oldest_key]
+        
+        return occ_mask_final
 
     def _preserve_foreground_occlusions(
         self,
@@ -1245,10 +1302,13 @@ class ReActorV3:
         """
         Run face detection on an image and return the embedding of the largest face.
         Used for identity-aware restore weight computation.
+        
+        Note: This method is optimized to avoid copying the full image.
         """
         if self.face_analyser is None:
             return None
         try:
+            # Pass image directly without copying to reduce memory usage
             faces = self.face_analyser.get(img)
             if faces:
                 best = max(
@@ -1257,7 +1317,11 @@ class ReActorV3:
                     if hasattr(f, 'bbox') else 0
                 )
                 if hasattr(best, 'embedding') and best.embedding is not None:
-                    return best.embedding
+                    # Validate embedding shape
+                    if isinstance(best.embedding, np.ndarray) and best.embedding.shape == (512,):
+                        return best.embedding
+                    else:
+                        print(f"[ReActor V3] Warning: Invalid embedding shape: {best.embedding.shape if isinstance(best.embedding, np.ndarray) else 'not ndarray'}")
         except Exception as e:
             print(f"[ReActor V3] Could not extract embedding: {e}")
         return None
@@ -1484,8 +1548,11 @@ class ReActorV3:
                 
             elif gender_match in ['M', 'F']:  # Filter by specific gender
                 print(f"[ReActor V3] Gender Filter: {gender_match}")
+                src_before = len(source_faces)
+                tgt_before = len(target_faces)
                 source_faces = self.filter_faces_by_gender(source_faces, gender_match)
                 target_faces = self.filter_faces_by_gender(target_faces, gender_match)
+                print(f"[ReActor V3]   Filtered: Source {src_before} → {len(source_faces)} faces, Target {tgt_before} → {len(target_faces)} faces")
                 
                 if not source_faces:
                     gender_name = "male" if gender_match == 'M' else "female"
@@ -1587,11 +1654,10 @@ class ReActorV3:
                             result = auto_fix_face(
                                 reference_img=source_img, output_img=result,
                                 face_analyser=self.face_analyser,
+                                ref_face=source_face,  # Pass pre-detected source face to avoid re-detection
                                 target_img=target_img, source_face=source_face,
                                 target_face=target_face,
                             )
-                        if self.auto_cleanup:
-                            self.cleanup_memory(aggressive=self.aggressive_cleanup)
                         return result, "Swapped (GPEN skipped — face already sharp/large)"
 
                     t0_restore = time.time()
@@ -1620,6 +1686,7 @@ class ReActorV3:
                             reference_img=source_img,
                             output_img=restored_result,
                             face_analyser=self.face_analyser,
+                            ref_face=source_face,  # Pass pre-detected source face to avoid re-detection
                             target_img=target_img,
                             source_face=source_face,
                             target_face=target_face,
@@ -1652,9 +1719,6 @@ class ReActorV3:
                     print(f"[ReActor V3] ── Total pipeline time: {pipeline_elapsed:.3f}s ──")
                     print("[ReActor V3] ════════════════════════════════════════")
                     print("")
-                    # Automatic VRAM cleanup after processing
-                    if self.auto_cleanup:
-                        self.cleanup_memory(aggressive=self.aggressive_cleanup)
                     return restored_result, f"Swapped and restored with {restore_model}"
             
             # ── Face-fix without GPEN (when no restore model or GPEN skipped by composite mode) ──
@@ -1665,16 +1729,14 @@ class ReActorV3:
                     reference_img=source_img,
                     output_img=result,
                     face_analyser=self.face_analyser,
+                    ref_face=source_face,  # Pass pre-detected source face to avoid re-detection
                     target_img=target_img,
                     source_face=source_face,
                     target_face=target_face,
                 )
                 fix_elapsed = time.time() - t0_fix
                 print(f"[ReActor V3]   Adaptive face enhancement completed in {fix_elapsed:.3f}s")
-
-            # Automatic VRAM cleanup after processing
-            if self.auto_cleanup:
-                self.cleanup_memory(aggressive=self.aggressive_cleanup)
+            
             print(f"[ReActor V3] ✓ Face swapped successfully (no restoration)")
             pipeline_elapsed = time.time() - pipeline_start
             print(f"[ReActor V3] ── Total pipeline time: {pipeline_elapsed:.3f}s ──")
@@ -1686,10 +1748,12 @@ class ReActorV3:
             print(f"[ReActor V3] ✗ ERROR: {e}")
             import traceback
             traceback.print_exc()
-            # Cleanup even on error
+            return target_img, f"Error: {str(e)}"
+        
+        finally:
+            # Always cleanup memory, even on errors
             if self.auto_cleanup:
                 self.cleanup_memory(aggressive=self.aggressive_cleanup)
-            return target_img, f"Error: {str(e)}"
     
     def cleanup_memory(self, aggressive: bool = False):
         """
@@ -1702,6 +1766,10 @@ class ReActorV3:
             aggressive: If True, unload all cached models including InsightFace and GPEN
         """
         print(f"[ReActor V3] ── Memory Cleanup (aggressive={aggressive}) ──")
+        
+        # Initialize variables to prevent NameError in finally block
+        vram_before_alloc = 0.0
+        vram_before_res = 0.0
         
         if torch.cuda.is_available():
             vram_before_alloc = torch.cuda.memory_allocated() / (1024**3)
@@ -1759,11 +1827,16 @@ class ReActorV3:
         return ['None'] + get_available_gpen_models(self.facerestore_path)
 
 
-# Global instance
+# Global instance with thread-safe initialization
 reactor_v3_engine: Optional[ReActorV3] = None
+_reactor_v3_lock = threading.Lock()
 
 def get_reactor_v3_engine(models_path: str) -> ReActorV3:
+    """Thread-safe singleton getter for ReActorV3 engine."""
     global reactor_v3_engine
     if reactor_v3_engine is None:
-        reactor_v3_engine = ReActorV3(models_path)
+        with _reactor_v3_lock:
+            # Double-check pattern to avoid race condition
+            if reactor_v3_engine is None:
+                reactor_v3_engine = ReActorV3(models_path)
     return reactor_v3_engine
