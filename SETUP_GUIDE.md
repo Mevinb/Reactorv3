@@ -13,19 +13,16 @@ cd stable-diffusion-webui-forge/extensions
 git clone https://github.com/yourusername/sd-webui-reactor-v3.git
 ```
 
-### Step 2: Download GPEN Models
+### Step 2: First-Swap Auto Model Download
 
-Download at least one GPEN model:
+On your first actual swap attempt, ReActor V3 auto-downloads required models:
 
-**Option A: GPEN-512 (Recommended - Faster)**
-- Download: [GPEN-BFR-512.onnx](https://huggingface.co/yangxy/GPEN/blob/main/GPEN-BFR-512.onnx)
-- Size: ~330 MB
-- Place in: `extensions/sd-webui-reactor-v3/models/facerestore_models/`
+- `GPEN-BFR-512.onnx` to `models/facerestore_models/`
+- `inswapper_128.onnx` to `models/insightface/`
 
-**Option B: GPEN-1024 (Ultra Quality - Slower)**
-- Download: [GPEN-BFR-1024.onnx](https://modelscope.cn/models/damo/GPEN-BFR-1024)
-- Size: ~330 MB
-- Place in: `extensions/sd-webui-reactor-v3/models/facerestore_models/`
+No manual model copy is required for these defaults.
+
+**Optional:** Download `GPEN-BFR-1024.onnx` manually for ultra quality and place it in `models/facerestore_models/`.
 
 ### Step 3: Restart WebUI
 
@@ -49,15 +46,21 @@ After setup, your directory should look like:
 
 ```
 extensions/sd-webui-reactor-v3/
-├── models/
-│   ├── facerestore_models/
-│   │   ├── GPEN-BFR-512.onnx      ← Put GPEN models here
-│   │   └── GPEN-BFR-1024.onnx     ← Optional but recommended
-│   └── insightface/                ← Auto-downloaded (first run)
 ├── scripts/                        ← Python code
 ├── install.py
 ├── requirements.txt
 └── README.md
+```
+
+Shared WebUI model folders used at runtime:
+
+```
+webui/models/
+├── facerestore_models/
+│   ├── GPEN-BFR-512.onnx           ← Auto-downloaded on first swap
+│   └── GPEN-BFR-1024.onnx          ← Optional manual add
+└── insightface/
+   └── inswapper_128.onnx          ← Auto-downloaded on first swap
 ```
 
 ---
@@ -68,10 +71,10 @@ extensions/sd-webui-reactor-v3/
 ✅ **Fix:** Ensure face is clearly visible, well-lit, and frontal
 
 ### Issue 2: "Model not found"  
-✅ **Fix:** Verify GPEN .onnx files are in `models/facerestore_models/`
+✅ **Fix:** Trigger one swap so first-run auto-download runs, then verify `models/facerestore_models/`
 
 ### Issue 3: First run is slow
-✅ **This is normal:** InsightFace is downloading ~500MB of face detection models
+✅ **This is normal:** ReActor V3 is downloading required models on first swap (GPEN-512 + inswapper), and InsightFace may also download buffalo_l (~500MB)
 
 ### Issue 4: Import errors
 ✅ **Fix:** Manually install dependencies:
@@ -130,7 +133,9 @@ pip install insightface onnxruntime-gpu opencv-python
 Before asking for help, verify:
 
 - [ ] Extension folder exists: `extensions/sd-webui-reactor-v3/`
+- [ ] Ran one swap once to trigger auto-download
 - [ ] GPEN model exists: `models/facerestore_models/GPEN-BFR-512.onnx`
+- [ ] InSwapper exists: `models/insightface/inswapper_128.onnx`
 - [ ] WebUI restarted after installation
 - [ ] "ReActor V3" tab appears in WebUI
 - [ ] Console shows no red error messages

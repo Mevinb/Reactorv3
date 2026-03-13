@@ -77,42 +77,33 @@ After restart, you should see a new **"ReActor V3"** tab in the WebUI. If not, c
 
 ReActor V3 requires two types of models:
 
-#### 1. GPEN Restoration Models (Required)
+#### 1. First-Run Auto-Downloaded Models
 
-Download GPEN models and place them in:
-```
-extensions/sd-webui-reactor-v3/models/facerestore_models/
-```
+On the first actual swap attempt, ReActor V3 automatically downloads required models
+to the shared WebUI models directory:
 
-**Download Links:**
+- **GPEN-BFR-512.onnx** (required default restorer)
+   - Saved to: `models/facerestore_models/`
+   - Source: Hugging Face direct URL
+- **inswapper_128.onnx** (required default face swapper)
+   - Saved to: `models/insightface/`
+   - Source: Hugging Face direct URL
 
-- **GPEN-BFR-512.onnx** (Recommended for most use cases)
-  - [Download from Hugging Face](https://huggingface.co/yangxy/GPEN/blob/main/GPEN-BFR-512.onnx)
-  - Size: ~330 MB
-  - Speed: ~80ms per face (RTX 3060)
+If internet is unavailable, ReActor V3 prints a warning and continues without hard stop.
+
+#### 2. Optional Manual Models
+
+Optional quality model:
 
 - **GPEN-BFR-1024.onnx** (For ultra-quality)
-  - [Download from ModelScope](https://modelscope.cn/models/damo/GPEN-BFR-1024)
-  - Size: ~330 MB  
-  - Speed: ~250ms per face (RTX 3060)
+   - [Download from ModelScope](https://modelscope.cn/models/damo/GPEN-BFR-1024)
+   - Place in: `models/facerestore_models/`
 
-**Note:** If pre-converted ONNX files are unavailable, you can convert PyTorch weights:
-```python
-# See conversion script in docs/convert_gpen_to_onnx.py
-```
+#### 3. InsightFace Detection Pack (Auto-Downloaded)
 
-#### 2. InsightFace Models (Auto-Downloaded)
+InsightFace also auto-downloads the Buffalo_l detection pack (~500MB) on first use.
 
-On first run, InsightFace will automatically download:
-- Buffalo_l face detection model (~500MB)
-- This is completely normal and happens once
-
-The models will be saved to:
-```
-extensions/sd-webui-reactor-v3/models/insightface/
-```
-
-#### 3. Face Swapper Model (Optional)
+#### 4. Face Swapper Model Locations
 
 ReActor V3 looks for swapper models in multiple locations:
 - `models/insightface/models/` (standard location)
@@ -247,7 +238,7 @@ Tested on NVIDIA RTX 3060 (12GB VRAM):
 **Solutions:**
 ```bash
 # Verify files exist:
-ls extensions/sd-webui-reactor-v3/models/facerestore_models/
+ls models/facerestore_models/
 
 # Should show:
 # GPEN-BFR-512.onnx
@@ -257,6 +248,7 @@ ls extensions/sd-webui-reactor-v3/models/facerestore_models/
 - Ensure filenames match exactly (case-sensitive)
 - Re-download if files are corrupted
 - Check file permissions
+- Trigger one swap once so auto-download can run
 
 #### 3. "CUDAExecutionProvider not found"
 
@@ -341,7 +333,7 @@ Currently, ReActor V3 UI supports single image processing. For batch processing:
 from scripts.reactor_v3_swapper import get_reactor_v3_engine
 import cv2
 
-engine = get_reactor_v3_engine('extensions/sd-webui-reactor-v3/models')
+engine = get_reactor_v3_engine('models')
 
 # Process multiple images
 for target_path in target_images:
@@ -370,7 +362,7 @@ ReActor V3 can be used in combination with img2img:
 To use custom swapper models (e.g., HyperSwap):
 
 1. Place model in one of these locations:
-   - `extensions/sd-webui-reactor-v3/models/insightface/models/`
+   - `models/insightface/models/`
    - `models/reactor/`
    - `models/hyperswap/`
 
@@ -500,12 +492,17 @@ sd-webui-reactor-v3/
 │   ├── reactor_v3_swapper.py         # Main face swapping pipeline
 │   ├── reactor_v3_gpen_restorer.py   # GPEN restoration wrapper
 │   └── reactor_v3_face_utils.py      # Face alignment utilities
-├── models/
-│   ├── facerestore_models/           # GPEN models go here
-│   └── insightface/                  # InsightFace models (auto-downloaded)
 ├── install.py                        # Dependency installer
 ├── requirements.txt                  # Package requirements
 └── README.md                         # This file
+```
+
+Shared runtime model folders used by ReActor V3:
+
+```
+webui/models/
+├── facerestore_models/               # GPEN models
+└── insightface/                      # InSwapper + InsightFace models
 ```
 
 ### Extending ReActor V3

@@ -26,6 +26,7 @@ if _ext_scripts_path not in sys.path:
 
 # Import the SIMPLIFIED version
 from reactor_v3_swapper_new import get_reactor_v3_engine
+from reactor_v3_model_bootstrap import ensure_reactor_v3_models
 
 # Import adaptive pipeline
 from reactor_v3_adaptive import (
@@ -260,18 +261,18 @@ class ReactorV3Script(scripts.Script):
                     )
 
             # ── Auto Face Match block ─────────────────────────────────────────
-            with gr.Accordion("🎯 Auto Face Match (Embedding-Based)", open=False):
+            with gr.Accordion("🎯 Auto Face Match — Multi-Person", open=False):
                 gr.Markdown("""
-                **Automatic face detection & matching** using ArcFace embedding cosine similarity.
-                No more manual face index selection — the system automatically finds which target face
-                best matches each source face and swaps only the correct ones.
+                **Multi-person face swapping** with strict same-gender enforcement and shape-aware matching.
+                Every target face is matched to the most similar source face of the **same gender only** — male→male and female→female, never crossed.
+                Faces with no valid same-gender source are left untouched.
                 """)
 
                 with gr.Row():
                     auto_match_enabled = gr.Checkbox(
                         label="Enable Auto Face Match",
                         value=True,
-                        info="Automatically detect and match faces by embedding similarity (no manual index needed)"
+                        info="Automatically detect and match all faces by similarity (no manual index needed)"
                     )
                     auto_match_threshold = gr.Slider(
                         minimum=0.0,
@@ -279,7 +280,22 @@ class ReactorV3Script(scripts.Script):
                         step=0.05,
                         value=0.20,
                         label="Match Similarity Threshold",
-                        info="Minimum cosine similarity to accept a match (lower = more permissive, 0.3+ = strict)"
+                        info="Minimum combined score for primary optimal assignment (0.2 = permissive, 0.4 = moderate)"
+                    )
+
+                with gr.Row():
+                    strict_gender_enabled = gr.Checkbox(
+                        label="Strict Gender Lock (♂→♂ / ♀→♀ only)",
+                        value=True,
+                        info="Hard-block opposite-gender swaps. Male sources only go to male targets and vice versa."
+                    )
+                    shape_weight = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.05,
+                        value=0.25,
+                        label="Face-Shape Weight",
+                        info="How much face shape (landmarks/ratios) contributes to matching vs identity embedding. 0=embedding only, 0.25=default blend"
                     )
 
                 with gr.Row():
@@ -297,19 +313,20 @@ class ReactorV3Script(scripts.Script):
                         )
 
                 gr.Markdown("""
-                **How it works:**
-                - Detects ALL faces in source image(s) and target image
-                - Computes 512-dim ArcFace embedding for each face
-                - Calculates cosine similarity between every source↔target pair
-                - Uses Hungarian algorithm for globally optimal 1:1 assignment
-                - Swaps only matched pairs above the similarity threshold
-                
+                **How multi-person matching works:**
+                - Detects ALL faces in all source image(s) and the target image
+                - Computes a **combined score** per pair: `identity_weight × ArcFace_similarity + shape_weight × shape_similarity`
+                - Runs **Hungarian algorithm** (globally optimal 1:1 assignment) for primary matches above threshold
+                - Runs **coverage pass**: unmatched targets are assigned the best valid same-gender source
+                - Opposite-gender pairs are **hard-blocked** when Strict Gender Lock is enabled
+                - Faces with no valid same-gender source are left unchanged
+
                 **Use cases:**
-                - **1 source, multi-target**: Only the best-matching target face gets swapped
-                - **Multi-source, multi-target**: Each source auto-matched to its best target
-                - **Additional sources**: Upload extra face images for multi-person swapping
-                
-                **Threshold guide:** 0.0 = always match, 0.2 = permissive, 0.4 = moderate, 0.6+ = strict same-person only
+                - **1 source, 1 target**: simple swap
+                - **1 source, multi-target**: best-matching target swapped first; remaining covered if sources allow
+                - **Multi-source, multi-target**: each person matched to most similar same-gender source
+
+                **Threshold guide:** 0.2 = permissive, 0.4 = moderate, 0.6+ = same-person only
                 """)
 
             # ── Adaptive Pipeline block ──────────────────────────────────────
@@ -383,7 +400,7 @@ class ReactorV3Script(scripts.Script):
             - **Gender Filter**: Use M/F to swap only male or female faces regardless of source
             - **Aggressive Cleanup**: Enable if you have limited VRAM (<12GB) for consistent speed
             - **Multi-person swap**: Upload additional source faces in Auto Face Match section            - **Auto Face Detail Fix**: Compares reference face detail to output and auto-corrects sharpness/texture            
-            **📁 Model Location:** `extensions/sd-webui-reactor-v3/models/facerestore_models/`
+            **📁 Model Location:** `models/facerestore_models/` (shared WebUI models folder)
             """)
             
             # Refresh button handler
@@ -406,6 +423,7 @@ class ReactorV3Script(scripts.Script):
             # auto face match controls
             auto_match_enabled, auto_match_threshold,
             source_image_2, source_image_3,
+            strict_gender_enabled, shape_weight,
             # adaptive controls
             adaptive_enabled, adaptive_max_retries, adaptive_confidence_threshold,
             adaptive_color_match, adaptive_swap_strength, adaptive_restore_strength,
@@ -429,6 +447,7 @@ class ReactorV3Script(scripts.Script):
                          # auto face match params
                          auto_match_enabled=True, auto_match_threshold=0.20,
                          source_image_2=None, source_image_3=None,
+                         strict_gender_enabled=True, shape_weight=0.25,
                          # adaptive params
                          adaptive_enabled=False, adaptive_max_retries=1,
                          adaptive_confidence_threshold=0.30,
@@ -493,6 +512,8 @@ class ReactorV3Script(scripts.Script):
             print(f"[ReActor V3]   Auto face detail fix: {auto_face_fix}")
             print(f"[ReActor V3]   Composite mode: {composite_mode}")
             print(f"[ReActor V3]   Strict no-fallback: {strict_no_fallback}")
+            print(f"[ReActor V3]   Strict gender lock: {strict_gender_enabled}")
+            print(f"[ReActor V3]   Shape weight: {shape_weight}")
             print(f"[ReActor V3]   Re-detect after swap: {redetect_after_swap}")
             print(f"[ReActor V3]   Adaptive pipeline: {adaptive_enabled}")
             if adaptive_enabled:
@@ -515,6 +536,15 @@ class ReactorV3Script(scripts.Script):
             webui_dir     = os.path.dirname(extensions_dir)
             models_path   = os.path.join(webui_dir, 'models')
 
+            bootstrap_status = ensure_reactor_v3_models(models_path)
+            if bootstrap_status['downloaded']:
+                print(f"[ReActor V3] Auto-downloaded models: {', '.join(bootstrap_status['downloaded'])}")
+            if bootstrap_status['failed']:
+                print(
+                    "[ReActor V3] WARNING: Some required models could not be downloaded "
+                    f"(continuing): {', '.join(bootstrap_status['failed'])}"
+                )
+
             engine = get_reactor_v3_engine(models_path)
             engine.set_cleanup_mode(aggressive_cleanup)
             engine.set_occlusion_handling(
@@ -530,6 +560,8 @@ class ReactorV3Script(scripts.Script):
             engine.set_auto_face_fix(bool(auto_face_fix))
             engine.set_composite_mode(str(composite_mode))
             engine.set_strict_no_fallback(bool(strict_no_fallback))
+            engine.set_strict_gender(bool(strict_gender_enabled))
+            engine.set_matching_weights(1.0 - float(shape_weight), float(shape_weight))
             engine.set_redetect_after_swap(bool(redetect_after_swap))
 
             source_cv2 = pil_to_cv2(source_image)
@@ -661,4 +693,6 @@ class ReactorV3Script(scripts.Script):
 
 print("[ReActor V3] Script loaded successfully")
 print("[ReActor V3] Will appear in img2img/txt2img tabs alongside other reactor extensions")
-print("[ReActor V3] Place GPEN models in: extensions/sd-webui-reactor-v3/models/facerestore_models/")
+print("[ReActor V3] GPEN models path: models/facerestore_models/")
+print("[ReActor V3] Face swapper path: models/insightface/")
+print("[ReActor V3] Required first-run models auto-download on first swap attempt")
